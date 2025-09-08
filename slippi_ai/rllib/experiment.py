@@ -227,7 +227,7 @@ class Experiment:
                 )
             )
             .reporting(
-                min_time_s_per_iteration=60,
+                min_time_s_per_iteration=60 * 6,
             )
         )
 
