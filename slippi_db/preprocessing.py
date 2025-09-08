@@ -203,7 +203,8 @@ BANNED_CHARACTERS = set([
 ALLOWED_CHARACTERS = set(Character) - BANNED_CHARACTERS
 ALLOWED_CHARACTER_VALUES = set(c.value for c in ALLOWED_CHARACTERS)
 
-MIN_SLP_VERSION = [2, 1, 0]
+# MIN_SLP_VERSION = [2, 1, 0]
+MIN_SLP_VERSION = [1, 7, 1]
 
 MIN_FRAMES = 60 * 60  # one minute
 GAME_TIME = 60 * 8  # eight minutes
@@ -216,13 +217,13 @@ def is_training_replay(meta_dict: dict) -> tuple[bool, str]:
   meta = Metadata.from_dict(meta_dict)
 
   if meta.slippi_version < MIN_SLP_VERSION:
-    return False, 'slippi version too low'
+    return False, 'slippi version too low, got {}'.format(meta.slippi_version)
   if meta.num_players != 2:
-    return False, 'not 1v1'
+    return False, 'not 1v1, got {} players'.format(meta.num_players)
   if meta.lastFrame < MIN_FRAMES:
-    return False, 'game length too short'
+    return False, 'game length too short, got {} frames'.format(meta.lastFrame)
   if meta.timer != GAME_TIME:
-    return False, 'timer not set to 8 minutes'
+    return False, 'timer not set to 8 minutes, got {} minutes'.format(meta.timer)
   if enums.to_internal_stage(meta.stage) == enums.Stage.NO_STAGE:
     return False, 'invalid stage'
 

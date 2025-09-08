@@ -6,12 +6,12 @@
 # be set so that num_envs / inner_batch_size is approximately the number of CPU
 # threads you have available. The rest of the parameters can be left as is.
 
-CHAR=fox
+CHAR=all
 # What player(s) from the dataset should we condition on?
 # This can be a comma-separated list.
-NAME="Master Player"
+NAME="ＤＡＲＫ"
 D=18
-TAG=${CHAR}_delay_${D}
+TAG=rl_${CHAR}_delay_${D}
 
 python slippi_ai/rl/run.py \
   --config.runtime.tag=$TAG \

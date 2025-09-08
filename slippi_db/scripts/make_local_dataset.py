@@ -116,7 +116,7 @@ def main(_):
     if make_tar:
       tar.add(parsed_path, arcname='games/' + md5)
 
-  print(f"Missing: {missing}")
+  print(f"Missing: {missing.most_common()}")
 
   # write metadata
   meta_path = os.path.join(ROOT.value, 'meta.json')

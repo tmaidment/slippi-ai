@@ -31,6 +31,7 @@ overwriting any existing files in Parsed, and will update parsed.pkl.
 
 import concurrent.futures
 import json
+import logging
 import os
 import pickle
 from typing import Optional
@@ -52,6 +53,7 @@ def parse_slp(
     tmpdir: str,
     compression: CompressionType = CompressionType.NONE,
     compression_level: Optional[int] = None,
+    log_file: Optional[str] = None,
 ) -> dict:
   result = dict(name=file.name)
 
@@ -79,6 +81,12 @@ def parse_slp(
           not_training_reason=reason,
       )
 
+      # Log training status and reason
+      if log_file:
+        log_entry = f"{file.name}: is_training={is_training}, reason={reason if not is_training else 'N/A'}\n"
+        with open(log_file, 'a') as f:
+          f.write(log_entry)
+
       if is_training:
         game = parse_peppi.from_peppi(game)
         game_bytes = parsing_utils.convert_game(
@@ -96,6 +104,11 @@ def parse_slp(
     raise
   except BaseException as e:
     result.update(valid=False, reason=repr(e))
+    # Log parsing error
+    if log_file:
+      log_entry = f"{file.name}: is_training=False, reason=parsing_error({repr(e)})\n"
+      with open(log_file, 'a') as f:
+        f.write(log_entry)
   # except:  # should be a catch-all, but sadly prevents KeyboardInterrupt?
   #   result.update(valid=False, reason='uncaught exception')
 
@@ -110,10 +123,12 @@ def parse_files(
     tmpdir: str,
     num_threads: int = 1,
     compression_options: dict = {},
+    log_file: Optional[str] = None,
 ) -> list[dict]:
   parse_slp_kwargs = dict(
       output_dir=output_dir,
       tmpdir=tmpdir,
+      log_file=log_file,
       **compression_options,
   )
 
@@ -146,10 +161,12 @@ def parse_chunk(
     tmpdir: str,
     compression_options: dict = {},
     pool: Optional[concurrent.futures.ProcessPoolExecutor] = None,
+    log_file: Optional[str] = None,
 ) -> list[dict]:
   parse_slp_kwargs = dict(
       output_dir=output_dir,
       tmpdir=tmpdir,
+      log_file=log_file,
       **compression_options,
   )
 
@@ -172,6 +189,7 @@ def parse_7zs(
     compression_options: dict = {},
     chunk_size_gb: float = 0.5,
     in_memory: bool = True,
+    log_file: Optional[str] = None,
 ) -> list[dict]:
   print("Processing 7z files.")
   to_process = [f for f in to_process if f.endswith('.7z')]
@@ -213,7 +231,8 @@ def parse_7zs(
             files, output_dir,
             tmpdir=utils.get_tmp_dir(in_memory=in_memory),
             compression_options=compression_options,
-            pool=pool)
+            pool=pool,
+            log_file=log_file)
       except BaseException as e:
         # print(e)
         if pool is not None:
@@ -283,10 +302,17 @@ def run_parsing(
   output_dir = os.path.join(root, 'Parsed')
   os.makedirs(output_dir, exist_ok=True)
 
+  # Initialize log file
+  log_file = os.path.join(root, 'training_replay_log.log')
+  # Clear existing log file for fresh run
+  with open(log_file, 'w') as f:
+    f.write("# Training Replay Log\n")
+    f.write("# Format: filename: is_training=<bool>, reason=<reason>\n\n")
+
   # Special-case 7z files which we process in chunks.
   results = parse_7zs(
       raw_dir, to_process, output_dir, num_threads,
-      compression_options, chunk_size_gb, in_memory)
+      compression_options, chunk_size_gb, in_memory, log_file)
 
   # Now handle zip files.
   print("Processing zip files.")
@@ -304,7 +330,7 @@ def run_parsing(
   # TODO: handle raw .slp and .slp.gz files
 
   zip_results = parse_files(
-      slp_files, output_dir, tmpdir, num_threads, compression_options)
+      slp_files, output_dir, tmpdir, num_threads, compression_options, log_file)
   assert len(zip_results) == len(slp_files)
 
   # Point back to raw file

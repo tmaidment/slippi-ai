@@ -47,6 +47,8 @@ def get_player(player: pa.StructArray) -> types.Player:
   position = post.field('position')
   pre = leader.field('pre')
 
+  feature_len = len(get_post('percent'))
+
   return types.Player(
       percent=np.asarray(get_post('percent'), dtype=np.uint16),
       facing=get_post('direction').to_numpy() > 0,
@@ -54,9 +56,10 @@ def get_player(player: pa.StructArray) -> types.Player:
       y=position.field('y'),
       action=get_post('state'),
       # libmelee does extra processing to determine invulnerability
-      invulnerable=get_post('hurtbox_state').to_numpy() != 0,
+      # NOTE: we are setting invulnerability to False for now to support older replays
+      invulnerable=np.logical_not([False]*feature_len), # get_post('hurtbox_state').to_numpy() != 0,
       character=get_post('character'),  # uint8
-      jumps_left=get_post('jumps'),  # uint8
+      jumps_left=np.zeros(feature_len, dtype=np.uint8), #get_post('jumps'),  # uint8
       shield_strength=get_post('shield'),  # float
       controller=types.Controller(
           main_stick=get_stick(pre.field('joystick')),
@@ -65,8 +68,9 @@ def get_player(player: pa.StructArray) -> types.Player:
           shoulder=pre.field('triggers'),
           buttons=get_buttons(pre.field('buttons_physical')),
       ),
-      on_ground=np.logical_not(
-          post.field('airborne').to_numpy(zero_copy_only=False)),
+      on_ground =np.logical_not([False]*feature_len),
+      # on_ground=np.logical_not(
+      #     post.field('airborne').to_numpy(zero_copy_only=False)),
   )
 
 def from_peppi(game: peppi_py.Game) -> types.GAME_TYPE:

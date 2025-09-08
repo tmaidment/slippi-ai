@@ -10,8 +10,8 @@ RUNTIME=$(($NUM_DAYS * 24 * 60 * 60))
 DATA_DIR="$DATA_ROOT/Parsed"
 META_PATH="$DATA_ROOT/meta.json"
 
-DELAY="18"
-CHAR="fox"
+DELAY="21"
+CHAR="all"
 
 python scripts/train.py \
   --wandb.mode=online \
