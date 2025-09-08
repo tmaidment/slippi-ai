@@ -380,9 +380,6 @@ class SlippiMultiAgentEnv(MultiAgentEnv):
 
         # Evaluation flag
         self.evaluation = config.evaluation
-        
-        # Initialize pending reset state tracking
-        self._pending_reset_state = None
     
     def close(self):
         """Clean up resources when environment is closed."""
@@ -423,13 +420,8 @@ class SlippiMultiAgentEnv(MultiAgentEnv):
     
     def reset(self, *, seed=None, options=None) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict[str, Any]]]:
         """Reset the environment and return multi-agent observations and infos."""
-        # Use pending reset state if available, otherwise get from async environment
-        if hasattr(self, '_pending_reset_state') and self._pending_reset_state is not None:
-            env_output = self._pending_reset_state
-            self._pending_reset_state = None
-        else:
-            # Get initial state from async environment (it sends initial state on startup)
-            env_output = self._env.recv()
+        # Get initial state from async environment (it sends initial state on startup)
+        env_output = self._env.recv()
         
         # Debug: print available ports
         print(f"Available ports in gamestates: {list(env_output.gamestates.keys())}")
@@ -508,14 +500,6 @@ class SlippiMultiAgentEnv(MultiAgentEnv):
         # RLlib requires '__all__' key to indicate if the entire episode is done
         terminated['__all__'] = env_output.needs_reset
         truncated['__all__'] = False
-        
-        # If episode is done, we need to consume the next initial state
-        # The async environment automatically sends the initial state of the next episode
-        if env_output.needs_reset:
-            # Receive the initial state of the new episode that was automatically sent
-            self._pending_reset_state = self._env.recv()
-        else:
-            self._pending_reset_state = None
         
         return observations, rewards, terminated, truncated, infos
     
