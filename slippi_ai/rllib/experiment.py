@@ -226,6 +226,9 @@ class Experiment:
                     ]
                 )
             )
+            .reporting(
+                min_time_s_per_iteration=60,
+            )
         )
 
         if self.config.get("tune"):
@@ -252,7 +255,7 @@ class Experiment:
             config.training(
                 train_batch_size=2048,
                 # lr_schedule=[[0, 0.001], [5_000_000, 0.00075], [10_000_000, 3e-4]],
-                lr=4e-4,
+                lr=3e-5,
                 entropy_coeff=0.01,
                 # entropy_coeff_schedule=[[0, 0.03], [200_000_000, 0.01]],
                 gamma=0.99,

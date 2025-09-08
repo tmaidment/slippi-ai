@@ -11,7 +11,7 @@ from ray.rllib.env.multi_agent_env import MultiAgentEnv
 
 from slippi_ai.envs import Environment, SafeEnvironment, AsyncEnvMP
 from slippi_ai.rllib.torch_embed import create_torch_game_embedding
-from slippi_ai.reward import RewardConfig
+from slippi_ai.reward import RewardConfig, compute_rewards
 from slippi_ai.types import Game, Controller
 from slippi_ai.controller_lib import send_controller
 from slippi_ai import observations
@@ -512,11 +512,9 @@ class SlippiMultiAgentEnv(MultiAgentEnv):
         return obs_tensor.detach().cpu().numpy()
     
     def _calculate_reward(self, old_state: Game, new_state: Game, agent_id: str) -> float:
-        """Calculate reward for a specific agent based on game state changes."""
+        """Calculate reward for a specific agent based on game state changes using slippi_ai reward system."""
         if old_state is None:
             return 0.0
-            
-        reward = 0.0
         
         # Determine which player this agent controls
         if agent_id == "p1":
@@ -530,18 +528,72 @@ class SlippiMultiAgentEnv(MultiAgentEnv):
             old_player = old_state.p1
             old_opponent = old_state.p0
         
-        # Reward for dealing damage
-        damage_dealt = opponent.percent - old_opponent.percent
-        reward += damage_dealt * 0.01
+        reward = 0.0
         
-        # Penalty for taking damage
-        damage_taken = player.percent - old_player.percent
-        reward -= damage_taken * 0.01
+        # Use reward config from environment
+        config = self._reward_config
         
-        # Small survival reward
-        reward += 0.001
+        # 1. Death penalty (check if we died this frame)
+        from slippi_ai.reward import is_dying
+        old_dying = is_dying(np.array([old_player.action]))
+        new_dying = is_dying(np.array([player.action]))
+        if not old_dying[0] and new_dying[0]:  # Just died
+            reward -= 1.0
         
-        return reward
+        # 2. Damage rewards/penalties
+        damage_dealt = max(0, opponent.percent - old_opponent.percent)
+        damage_taken = max(0, player.percent - old_player.percent)
+        reward += damage_dealt * config.damage_ratio
+        reward -= damage_taken * config.damage_ratio
+        
+        # 3. Ledge grab penalty
+        if config.ledge_grab_penalty > 0:
+            from slippi_ai.reward import get_bad_ledge_grabs
+            # Create mini time series for this step
+            mini_player = type('Player', (), {
+                'action': np.array([old_player.action, player.action]),
+                'x': np.array([old_player.x, player.x]),
+            })()
+            mini_opponent = type('Player', (), {
+                'x': np.array([old_opponent.x, opponent.x]),
+                'invulnerable': np.array([old_opponent.invulnerable, opponent.invulnerable]),
+            })()
+            
+            bad_grabs = get_bad_ledge_grabs(mini_player, mini_opponent)
+            if len(bad_grabs) > 0 and bad_grabs[0]:
+                reward -= config.ledge_grab_penalty
+        
+        # 4. Approaching factor reward
+        if config.approaching_factor > 0:
+            from slippi_ai.reward import compute_approaching_factor
+            # Create mini time series for this step
+            mini_player = type('Player', (), {
+                'x': np.array([old_player.x, player.x]),
+                'y': np.array([old_player.y, player.y]),
+                'action': np.array([old_player.action, player.action]),
+            })()
+            mini_opponent = type('Player', (), {
+                'x': np.array([old_opponent.x, opponent.x]),
+                'y': np.array([old_opponent.y, opponent.y]),
+            })()
+            
+            approach = compute_approaching_factor(mini_player, mini_opponent)
+            if len(approach) > 0:
+                reward += config.approaching_factor * approach[0]
+        
+        # 5. Stalling penalty
+        if config.stalling_penalty > 0:
+            from slippi_ai.reward import is_stalling_offstage
+            stage_array = np.array([new_state.stage])
+            mini_player = type('Player', (), {
+                'x': np.array([player.x]),
+                'y': np.array([player.y]),
+            })()
+            
+            if is_stalling_offstage(mini_player, stage_array, config.stalling_threshold)[0]:
+                reward -= config.stalling_penalty / 60.0  # Per frame penalty
+        
+        return float(reward)
     
     def _action_to_controller(self, action: Dict[str, Any]) -> Controller:
         """Convert RLlib action format to controller format."""
