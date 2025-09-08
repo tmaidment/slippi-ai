@@ -318,7 +318,24 @@ def _run_env(
       if controllers is None:
         send(None)  # signal end of outputs
         return
-      send(env_step(controllers))
+      
+      # Execute step and get result
+      result = env_step(controllers)
+      send(result)
+      
+      # If the environment needs reset, wait for it to automatically reset
+      # and send the new initial state
+      if result.needs_reset if not batch_time else any(r.needs_reset for r in result):
+        # Environment should automatically reset, get the new initial state
+        try:
+          new_initial_state = env.current_state()
+          if batch_time:
+            new_initial_state = [new_initial_state]
+          send(new_initial_state)
+        except Exception as e:
+          # If getting new state fails, the environment might be broken
+          send(EnvError(f"Failed to get state after reset: {e}"))
+          return
 
     # conn.close()
   except KeyboardInterrupt:
