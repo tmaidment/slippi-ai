@@ -10,12 +10,12 @@ RUNTIME=$(($NUM_DAYS * 24 * 60 * 60))
 DATA_DIR="$DATA_ROOT/Parsed"
 META_PATH="$DATA_ROOT/meta.json"
 
-DELAY="18"
-CHAR="fox"
+DELAY="21"
+CHAR="all"
 
 python scripts/train.py \
   --wandb.mode=online \
-  --config.tag=${CHAR}_delay_${DELAY} \
+  --config.tag=il_${CHAR}_delay_${DELAY} \
   --config.policy.delay=$DELAY \
   --config.data.batch_size=512 \
   --config.data.unroll_length=80 \

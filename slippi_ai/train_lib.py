@@ -73,6 +73,17 @@ def mean(value):
     value = value.mean().item()
   return value
 
+def flatten_dict_with_slashes(nested_dict, parent_key='', sep='/'):
+  """Flatten a nested dictionary using slashes as separators instead of dots."""
+  items = []
+  for k, v in nested_dict.items():
+    new_key = f"{parent_key}{sep}{k}" if parent_key else k
+    if isinstance(v, dict):
+      items.extend(flatten_dict_with_slashes(v, new_key, sep=sep).items())
+    else:
+      items.append((new_key, v))
+  return dict(items)
+
 def log_stats(
     stats: tree.Structure,
     step: tp.Optional[int] = None,
@@ -80,6 +91,11 @@ def log_stats(
 ):
   if take_mean:
     stats = tree.map_structure(mean, stats)
+  
+  # Flatten nested dictionaries with slashes instead of letting wandb use dots
+  if isinstance(stats, dict):
+    stats = flatten_dict_with_slashes(stats)
+  
   wandb.log(data=stats, step=step)
 
 _field = utils.field

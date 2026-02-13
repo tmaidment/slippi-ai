@@ -6,12 +6,12 @@
 # be set so that num_envs / inner_batch_size is approximately the number of CPU
 # threads you have available. The rest of the parameters can be left as is.
 
-CHAR=fox
+CHAR=all
 # What player(s) from the dataset should we condition on?
 # This can be a comma-separated list.
 NAME="Master Player"
-D=18
-TAG=${CHAR}_delay_${D}
+D=21
+TAG=rl_${CHAR}_delay_${D}
 
 python slippi_ai/rl/run.py \
   --config.runtime.tag=$TAG \
@@ -32,7 +32,7 @@ python slippi_ai/rl/run.py \
   --config.learner.ppo.beta=3e-1 \
   --config.learner.ppo.epsilon=1e-2 \
   --config.learner.ppo.minibatched=False \
-  --config.teacher=pickled_models/${CHAR}_d${D}_imitation \
+  --config.teacher=pickled_models/${CHAR}_d${D}_imitation_v3 \
   --config.opponent.type=self \
   --config.opponent.train=True \
   --config.actor.rollout_length=240 \

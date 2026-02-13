@@ -40,6 +40,8 @@ class LearnerConfig:
   value_cost: float = 0.5
   reward_halflife: float = 4  # measured in seconds
   discount_on_death: tp.Optional[float] = None
+  # Polyak/EMA averaging for teacher
+  teacher_ema_momentum: float = 0.0  # 0.0 disables EMA, typical values: 0.999, 0.9999
   reward: reward_lib.RewardConfig = field(reward_lib.RewardConfig)
   ppo: PPOConfig = field(PPOConfig)
 
@@ -120,6 +122,10 @@ class Learner:
     self._use_separate_vf = value_function is not None
     self._value_function = value_function or vf_lib.FakeValueFunction()
 
+    # EMA teacher variables (initialized later in initialize())
+    self._ema_teacher_vars = None
+    self._use_ema_teacher = config.teacher_ema_momentum > 0.0
+
     if learning_rate is None:
       learning_rate = tf.Variable(config.learning_rate, trainable=False)
     self.learning_rate = learning_rate
@@ -174,6 +180,38 @@ class Learner:
     entropies = controller_embedding.map(lambda _, d: d.entropy(), dist)
     return tf.add_n(list(controller_embedding.flatten(entropies)))
 
+  def _initialize_ema_teacher(self):
+    """Initialize EMA teacher variables as copies of current policy variables."""
+    if not self._use_ema_teacher:
+      return
+    
+    policy_vars = self._policy.variables
+    self._ema_teacher_vars = [
+        tf.Variable(var.value(), trainable=False, name=f"ema_teacher_{var.name}")
+        for var in policy_vars
+    ]
+
+  def _update_ema_teacher(self):
+    """Update EMA teacher variables using Polyak averaging."""
+    if not self._use_ema_teacher or self._ema_teacher_vars is None:
+      return
+    
+    momentum = self._config.teacher_ema_momentum
+    policy_vars = self._policy.variables
+    
+    for ema_var, policy_var in zip(self._ema_teacher_vars, policy_vars):
+      ema_var.assign(momentum * ema_var + (1 - momentum) * policy_var)
+
+  def _get_teacher_for_supervision(self):
+    """Returns the teacher to use for KL supervision (EMA or original)."""
+    if self._use_ema_teacher and self._ema_teacher_vars is not None:
+      # Temporarily assign EMA weights to teacher for forward pass
+      original_vars = [var.value() for var in self._teacher.variables]
+      for teacher_var, ema_var in zip(self._teacher.variables, self._ema_teacher_vars):
+        teacher_var.assign(ema_var)
+      return original_vars  # Return original values for restoration
+    return None
+
   def unroll(
       self,
       trajectory: Trajectory,
@@ -182,12 +220,20 @@ class Learner:
   ) -> tp.Tuple[LearnerOutputs, LearnerState]:
     assert len(trajectory.delayed_actions) == self._policy.delay
 
+    # Use EMA teacher if enabled
+    original_teacher_vars = self._get_teacher_for_supervision()
+    
     teacher_outputs = self._teacher.unroll(
         # TODO: use the teacher's name instead?
         frames=get_delayed_frames(trajectory),
         initial_state=initial_state.teacher,
         discount=self.discount,
     )
+    
+    # Restore original teacher weights if we used EMA
+    if original_teacher_vars is not None:
+      for teacher_var, original_val in zip(self._teacher.variables, original_teacher_vars):
+        teacher_var.assign(original_val)
 
     with tf.GradientTape() as tape:
       value_ouputs, final_value_state = self._value_function.loss(
@@ -465,6 +511,10 @@ class Learner:
           lambda v, c: v.assign(c), self.get_vars(), checkpoint_vars)
       reverted = True
 
+    # Update EMA teacher after PPO step
+    if not reverted:
+      self._update_ema_teacher()
+
     metrics = dict(
         ppo_step={str(i): d for i, d in enumerate(per_epoch_metrics)},
         post_update=per_epoch_metrics[-1],
@@ -492,6 +542,9 @@ class Learner:
     self._policy.unroll(frames, trajectory.initial_state)
     self._policy_vars = self._policy.variables
     self.policy_optimizer._initialize(self._policy_vars)
+    
+    # Initialize EMA teacher variables after policy is initialized
+    self._initialize_ema_teacher()
 
   def restore_from_imitation(self, imitation_state: dict):
     tf_state = self.get_vars()
