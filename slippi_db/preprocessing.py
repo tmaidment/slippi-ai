@@ -14,12 +14,12 @@ from slippi_db import parse_peppi
 from slippi_ai import types
 
 def assert_same_parse(game_path: str):
-  peppi_game_raw = peppi_py.read_slippi(game_path)
+  peppi_game_raw = parse_peppi.read_slippi(game_path)
   peppi_game = parse_peppi.from_peppi(peppi_game_raw)
-  peppi_game = types.array_to_nest(peppi_game)
+  peppi_game = types.array_to_nt(types.Game, peppi_game)
 
   libmelee_game = parse_libmelee.get_slp(game_path)
-  libmelee_game = types.array_to_nest(libmelee_game)
+  libmelee_game = types.array_to_nt(types.Game, libmelee_game)
 
   # def assert_equal(path, pv):
   #   lv = libmelee_game
@@ -37,10 +37,9 @@ def assert_same_parse(game_path: str):
   # tree.map_structure_with_path(assert_equal, peppi_game)
 
   def assert_equal(path, x, y):
-    try:
-      np.testing.assert_equal(x, y)
-    except AssertionError as e:
-      raise AssertionError(path) from e
+    diff_indices = np.arange(len(x))[x != y]
+    if diff_indices.size > 0:
+      raise AssertionError(f'{path} differs at {diff_indices.size} indices')
 
   tree.map_structure_with_path(assert_equal, peppi_game, libmelee_game)
 
@@ -65,8 +64,8 @@ class Metadata(typing.NamedTuple):
   stage: int
   timer: int
   is_teams: bool
-  # attempt to guess winner by looking at last frame
-  # index into player array, NOT port number
+  # Attempt to guess winner by looking at last frame.
+  # Note: indexes into player array, NOT port number.
   winner: Optional[int]
 
   # These are missing from ranked-anonymized replays
@@ -89,28 +88,57 @@ def mode(xs: np.ndarray):
   i = np.argmax(counts)
   return unique[i]
 
-def port_to_int(port: str) -> int:
-  assert port.startswith('P')
-  return int(port[1])
+_OPPONENT_IDX = {0: 1, 1: 0}
+
+def winner_from_lras(game: peppi_py.Game) -> Optional[int]:
+  """Assume that the LRAS player lost."""
+  end = game.end
+  if end is None or end.lras_initiator is None:
+    return None
+
+  port_to_index = {
+      player.port: idx for idx, player
+      in enumerate(game.start.players)
+  }
+
+  loser_idx = port_to_index[end.lras_initiator]
+  return _OPPONENT_IDX[loser_idx]
 
 def compute_winner(game: peppi_py.Game) -> Optional[int]:
-  if len(game.start['players']) > 2:
+  if len(game.start.players) > 2:
     # TODO: handle more than 2 players
     return None
 
-  last_frame = game.frames[-1]
+  end = game.end
+  if end is not None and end.players is not None:
+    for i, player_end in enumerate(end.players):
+      if player_end.placement == 0:
+        return i
+    raise ValueError('No player with placement = 0')
+
+  # Try to see who had nonzero stocks left on the last frame.
   stock_counts = {}
-  for port, player in last_frame['ports'].items():
-    stock_counts[port] = player['leader']['post']['stocks'].as_py()
+  for i, port in enumerate(game.frames.ports):
+    stock_counts[i] = port.leader.post.stocks[-1].as_py()
 
   # s is 0 or None for eliminated players
   losers = [p for p, s in stock_counts.items() if not s]
   if losers:
     winners = [p for p, s in stock_counts.items() if s]
     if len(winners) == 1:
-      return port_to_int(winners[0])
+      return winners[0]
+
+  lras_winner = winner_from_lras(game)
+  if lras_winner is not None:
+    return lras_winner
 
   return None
+
+def get_dict(obj: object, *keys: str) -> dict:
+  result = {}
+  for key in keys:
+    result[key] = getattr(obj, key)
+  return result
 
 def get_metadata(game: peppi_py.Game) -> dict:
   result = {}
@@ -122,38 +150,43 @@ def get_metadata(game: peppi_py.Game) -> dict:
       result[key] = metadata[key]
   del metadata
 
-  result['lastFrame'] = game.frames.field('id')[-1].as_py()
+  result['lastFrame'] = game.frames.id[-1].as_py()
 
   start = game.start
-  result['slippi_version'] = start['slippi']['version']
+  result['slippi_version'] = start.slippi.version
 
-  if result['slippi_version'] >= [3, 14, 0]:
-    result['match'] = start['match']
+  if result['slippi_version'] >= (3, 14, 0):
+    result['match'] = get_dict(start.match, 'id', 'game', 'tiebreaker')
 
-  players = start['players']
+  players = start.players
   player_metas = []
 
-  for player in players:
-    port = player['port']  # P[1-4]
+  for player, port in zip(players, game.frames.ports):
+    leader = port.leader
 
-    # get most-played character
+    # `player.character` is an "external ID", would need to map to internal ID
+    # See https://github.com/project-slippi/slippi-wiki/blob/master/SPEC.md#melee-ids
+    # assert int(cs[0]) == player.character
+
+    # get most-played character, in case of Zelda/Sheik switches
     if len(players) == 2:
-      leader = game.frames.field('ports').field(port).field('leader')
-      cs = leader.field('post').field('character').to_numpy()
-      character = int(mode(cs))
-      percent = leader.field('post').field('percent').to_numpy()
+      character = int(mode(leader.post.character.to_numpy()))
+      percent = leader.post.percent.to_numpy()
       damage = float(np.maximum(percent[1:] - percent[:-1], 0).sum())
     else: # Non-1v1 games will have nulls when players are eliminated
-      leader = game.frames[0]['ports'][port]['leader']
-      character = leader['post']['character'].as_py()
+      character = leader.post.character[0].as_py()
       damage = None
 
+    netplay = None
+    if player.netplay is not None:
+      netplay = get_dict(player.netplay, 'name', 'code', 'suid')
+
     player_metas.append(dict(
-        port=port_to_int(port),
+        port=player.port.value,
         character=character,
-        type=0 if player['type'] == 'Human' else 1,
-        name_tag=player['name_tag'],
-        netplay=player.get('netplay'),
+        type=player.type.value,  # 0 is human
+        name_tag=player.name_tag,
+        netplay=netplay,
         damage_taken=damage,
     ))
   result.update(
@@ -162,7 +195,7 @@ def get_metadata(game: peppi_py.Game) -> dict:
   )
 
   for key in ['stage', 'timer', 'is_teams']:
-    result[key] = start[key]
+    result[key] = getattr(start, key)
 
   # compute winner
   result['winner'] = compute_winner(game)
@@ -171,6 +204,7 @@ def get_metadata(game: peppi_py.Game) -> dict:
 
 def get_metadata_safe(path: str) -> dict:
   try:
+    # Sadly skip_frames=True crashed on some replays
     game = peppi_py.read_slippi(path)
     return get_metadata(game)
   except BaseException as e:
@@ -190,20 +224,13 @@ def get_metadata_safe(path: str) -> dict:
 
 
 BANNED_CHARACTERS = set([
-    # Kirby's actions aren't fully mapped out yet
-    Character.KIRBY,
-
-    # peppi-py bug with ICs
-    # Character.NANA.value,
-    # Character.POPO.value,
-
     Character.UNKNOWN_CHARACTER,
 ])
 
 ALLOWED_CHARACTERS = set(Character) - BANNED_CHARACTERS
 ALLOWED_CHARACTER_VALUES = set(c.value for c in ALLOWED_CHARACTERS)
 
-MIN_SLP_VERSION = [2, 1, 0]
+MIN_SLP_VERSION = (2, 1, 0)
 
 MIN_FRAMES = 60 * 60  # one minute
 GAME_TIME = 60 * 8  # eight minutes
@@ -212,7 +239,6 @@ def is_training_replay(meta_dict: dict) -> tuple[bool, str]:
   if meta_dict.get('invalid') or meta_dict.get('failed'):
     return False, meta_dict.get('reason', 'invalid or failed')
 
-  # del meta_dict['_id']
   meta = Metadata.from_dict(meta_dict)
 
   if meta.slippi_version < MIN_SLP_VERSION:
@@ -228,7 +254,6 @@ def is_training_replay(meta_dict: dict) -> tuple[bool, str]:
 
   for player in meta.players:
     if player.type != 0:
-      # import ipdb; ipdb.set_trace()
       return False, 'not human'
     if player.character not in ALLOWED_CHARACTER_VALUES:
       return False, 'invalid character'

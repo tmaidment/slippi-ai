@@ -10,7 +10,9 @@ if __name__ == '__main__':
   from absl import app, flags
   import fancyflags as ff
 
-  from slippi_ai import eval_lib, dolphin, utils, evaluators, flag_utils
+  import tensorflow as tf
+
+  from slippi_ai import eval_lib, dolphin, utils, evaluators, flag_utils, saving
 
   default_dolphin_config = dolphin.DolphinConfig(
       infinite_time=False,
@@ -34,41 +36,38 @@ if __name__ == '__main__':
   NUM_AGENT_STEPS = flags.DEFINE_integer(
       'num_agent_steps', 0, 'Number of agent steps to batch.')
 
-  agent_flags = eval_lib.BATCH_AGENT_FLAGS.copy()
-  agent_flags['jit_compile'] = ff.Boolean(True)
-  AGENT = ff.DEFINE_dict('agent', **agent_flags)
+  agent_flags = dict(
+      eval_lib.BATCH_AGENT_FLAGS,
+      jit_compile=ff.Boolean(True),
+  )
+  player_flags = dict(eval_lib.PLAYER_FLAGS, ai=agent_flags)
+  PLAYER = ff.DEFINE_dict('player', **player_flags)
 
   SELF_PLAY = flags.DEFINE_boolean('self_play', False, 'Self play.')
-  OPPONENT = ff.DEFINE_dict('opponent', **eval_lib.BATCH_PLAYER_FLAGS)
+  OPPONENT = ff.DEFINE_dict('opponent', **player_flags)
 
-  NUM_WORKERS = flags.DEFINE_integer('num_workers', 0, 'Number of rollout workers.')
+  TF_PROFILE = flags.DEFINE_boolean('tf_profile', False, 'Enable TF profiler.')
 
   def main(_):
-    p1_agent_kwargs: dict = AGENT.value.copy()
-    p1_state = eval_lib.load_state(p1_agent_kwargs)
-    p1_agent_kwargs.update(
-        state=p1_state,
-        batch_steps=NUM_AGENT_STEPS.value,
-    )
-
-    agent_kwargs = {1: p1_agent_kwargs}
-
-    if SELF_PLAY.value:
-      p2 = dolphin.AI()
-      agent_kwargs[2] = p1_agent_kwargs
-    else:
-      p2 = eval_lib.get_player(**OPPONENT.value)
-
-      if isinstance(p2, dolphin.AI):
-        p2_agent_kwargs: dict = OPPONENT.value['ai']
-        p2_state = eval_lib.load_state(p2_agent_kwargs)
-        p2_agent_kwargs.update(
-            state=p2_state,
+    player_kwargs = {
+        1: PLAYER.value,
+        2: PLAYER.value if SELF_PLAY.value else OPPONENT.value,
+    }
+    agent_kwargs = {}
+    players = {}
+    for port, pkwargs in player_kwargs.items():
+      player = eval_lib.get_player(**pkwargs)
+      players[port] = player
+      if isinstance(player, dolphin.AI):
+        akwargs: dict = pkwargs['ai'].copy()
+        # the evaluator wants the state, not a path
+        path = akwargs.pop('path')
+        akwargs.update(
+            state=saving.load_state_from_disk(path),
             batch_steps=NUM_AGENT_STEPS.value,
         )
-        agent_kwargs[2] = p2_agent_kwargs
+        agent_kwargs[port] = akwargs
 
-    players = {1: dolphin.AI(), 2: p2}
     dolphin_kwargs = dolphin.DolphinConfig.kwargs_from_flags(DOLPHIN.value)
     dolphin_kwargs.update(players=players)
 
@@ -90,11 +89,7 @@ if __name__ == '__main__':
         damage_ratio=0,
     )
 
-    if NUM_WORKERS.value == 0:
-      evaluator = evaluators.Evaluator(**evaluator_kwargs)
-    else:
-      evaluator = evaluators.RayEvaluator(
-          num_workers=NUM_WORKERS.value, **evaluator_kwargs)
+    evaluator = evaluators.Evaluator(**evaluator_kwargs)
 
     with evaluator.run():
       # burnin
@@ -102,9 +97,15 @@ if __name__ == '__main__':
       burnin_steps = math.ceil(32 / batch_steps) * batch_steps
       evaluator.rollout(burnin_steps)
 
+      if TF_PROFILE.value:
+        tf.profiler.experimental.start('tf_profile')
+
       timer = utils.Profiler(burnin=0)
       with timer:
         stats, metrics = evaluator.rollout(ROLLOUT_LENGTH.value)
+
+      if TF_PROFILE.value:
+        tf.profiler.experimental.stop()
 
     num_frames = NUM_ENVS.value * ROLLOUT_LENGTH.value
     num_minutes = num_frames / (60 * 60)
@@ -112,7 +113,7 @@ if __name__ == '__main__':
     print('ko diff per minute:', kdpm)
 
     timings = metrics['timing']
-    print('timings:', utils.map_single_structure(lambda f: f'{f:.3f}', timings))
+    print('timings:', utils.map_single_structure(lambda f: f'{f * 1000:.3f}', timings))
 
     sps = ROLLOUT_LENGTH.value / timer.cumtime
     fps = sps * NUM_ENVS.value

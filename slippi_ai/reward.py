@@ -50,7 +50,6 @@ def compute_approaching_factor(
   xy = np.stack([player.x, player.y], axis=-1)
   v = xy[1:] - xy[:-1]
 
-
   opp_xy = np.stack([opponent.x, opponent.y], axis=-1)
   dxy = normalize(opp_xy - xy)
 
@@ -114,6 +113,14 @@ class RewardConfig:
   approaching_factor: float = 0
   stalling_penalty: float = 0  # per second
   stalling_threshold: float = DEFAULT_STALLING_THRESHOLD
+  nana_ratio: float = 0.5
+
+def ko_diff(game: Game) -> np.ndarray:
+  """Compute the KO difference (p0 KOs - p1 KOs) per frame."""
+  p0_deaths = process_deaths(game.p0.action).astype(np.int32)
+  p1_deaths = process_deaths(game.p1.action).astype(np.int32)
+
+  return p1_deaths - p0_deaths
 
 def compute_rewards(
     game: Game,
@@ -122,6 +129,7 @@ def compute_rewards(
     approaching_factor: float = 0,
     stalling_penalty: float = 0,  # per second
     stalling_threshold: float = DEFAULT_STALLING_THRESHOLD,
+    nana_ratio: float = 0.5,
 ) -> np.ndarray:
   '''
     Args:
@@ -131,18 +139,28 @@ def compute_rewards(
       A length (T-1) np.array of rewards
   '''
 
-  def player_reward(player: Player, opponent: Player):
+  def compute_base_reward(player: Player) -> np.ndarray:
     deaths = process_deaths(player.action).astype(np.float32)
     damages = damage_ratio * process_damages(player.percent)
+    return - (deaths + damages)
+
+  def player_reward(player: Player, opponent: Player):
+    reward = compute_base_reward(player)
+
+    if nana_ratio != 0:
+      if player.nana == ():
+        raise ValueError("Nana data is required for nana_ratio != 0")
+      nana_reward = nana_ratio * compute_base_reward(player.nana)
+      nana_reward = np.where(player.nana.exists[1:], nana_reward, 0)
+      reward += nana_reward
 
     bad_ledge_grabs = get_bad_ledge_grabs(player, opponent).astype(np.float32)
-    ledge_grab_penalties = ledge_grab_penalty * bad_ledge_grabs
+    reward -= ledge_grab_penalty * bad_ledge_grabs
 
     stalling = is_stalling_offstage(player, game.stage, stalling_threshold)[1:]
-    stalling_penalties = (stalling_penalty / 60) * stalling.astype(np.float32)
+    reward -= (stalling_penalty / 60) * stalling.astype(np.float32)
 
-    reward = approaching_factor * compute_approaching_factor(player, opponent)
-    reward -= (deaths + damages + ledge_grab_penalties + stalling_penalties)
+    reward += approaching_factor * compute_approaching_factor(player, opponent)
 
     return reward
 
@@ -160,16 +178,31 @@ def player_stats(
     player: Player,
     opponent: Player,
     stage: np.ndarray,
-    stalling_threshold: float,
+    stalling_threshold: float = DEFAULT_STALLING_THRESHOLD,
 ) -> dict:
   FPM = 60 * 60
-  return dict(
+
+  stats = dict(
       deaths=process_deaths(player.action).mean() * FPM,
       damages=process_damages(player.percent).mean() * FPM,
       ledge_grabs=get_bad_ledge_grabs(player, opponent).mean() * FPM,
       approaching_factor=compute_approaching_factor(player, opponent).mean(),
       stalling=is_stalling_offstage(player, stage, stalling_threshold).mean(),
   )
+
+  if player.nana != ():
+    nana_deaths = process_deaths(player.nana.action).astype(np.float32)
+    nana_deaths = np.where(player.nana.exists[1:], nana_deaths, 0)
+
+    nana_damages = process_damages(player.nana.percent).astype(np.float32)
+    nana_damages = np.where(player.nana.exists[1:], nana_damages, 0)
+
+    stats.update(
+        nana_deaths=nana_deaths.mean() * FPM,
+        nana_damages=nana_damages.mean() * FPM,
+    )
+
+  return stats
 
 def player_stats_from_game(game: Game, swap: bool = False, **kwargs) -> dict:
   p0, p1 = (game.p1, game.p0) if swap else (game.p0, game.p1)

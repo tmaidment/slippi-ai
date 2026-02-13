@@ -1,8 +1,11 @@
 import atexit
 import collections
 import dataclasses
+import functools
 import itertools
 import json
+import logging
+import math
 import multiprocessing as mp
 import os
 import random
@@ -20,6 +23,7 @@ import melee
 
 from slippi_ai import reward, utils, nametags, paths, observations
 from slippi_ai.types import Game, game_array_to_nt, Controller
+from slippi_ai.mirror import mirror_game
 
 class PlayerMeta(NamedTuple):
   character: int
@@ -52,18 +56,20 @@ class ReplayInfo(NamedTuple):
   # We use empty tuple instead of None to play nicely with Tensorflow.
   meta: Union[ReplayMeta, Tuple[()]] = ()
 
+  mirror: bool = False
+
   @property
   def main_player(self) -> PlayerMeta:
+    if isinstance(self.swap, np.ndarray):
+      return utils.map_nt(
+          lambda p0, p1: np.where(self.swap, p1, p0),
+          self.meta.p0, self.meta.p1)
     return self.meta.p1 if self.swap else self.meta.p0
 
 class ChunkMeta(NamedTuple):
   start: int
   end: int
   info: ReplayInfo
-
-class Chunk(NamedTuple):
-  states: Game
-  meta: ChunkMeta
 
 # Action = TypeVar('Action')
 Action = Controller
@@ -85,6 +91,10 @@ class Frames(NamedTuple):
   is_resetting: bool
   # The reward will have length one less than the states and actions.
   reward: np.float32
+
+class Chunk(NamedTuple):
+  frames: Frames
+  meta: ChunkMeta
 
 class Batch(NamedTuple):
   frames: Frames
@@ -112,6 +122,7 @@ class DatasetConfig:
   banned_names: str = NONE
 
   swap: bool = True  # yield swapped versions of each replay
+  mirror: bool = False  # mirror left/right in each replay
   seed: int = 0
 
 def create_name_filter(
@@ -195,9 +206,13 @@ def replays_from_meta(config: DatasetConfig) -> List[ReplayInfo]:
 
   return replays
 
+
 def train_test_split(
     config: DatasetConfig,
 ) -> Tuple[List[ReplayInfo], List[ReplayInfo]]:
+  if config.data_dir is None:
+    raise ValueError("data_dir must be specified in DatasetConfig")
+
   filenames = sorted(os.listdir(config.data_dir))
   print(f"Found {len(filenames)} files.")
 
@@ -219,15 +234,34 @@ def train_test_split(
     for filename in filenames:
       replay_path = os.path.join(config.data_dir, filename)
       replays.append(ReplayInfo(replay_path, False))
-      replays.append(ReplayInfo(replay_path, True))
+      if config.swap:
+        replays.append(ReplayInfo(replay_path, True))
 
   # TODO: stable partition
+  if len(replays) < 2:
+    raise ValueError("Not enough replays found.")
+
   rng = random.Random(config.seed)
   rng.shuffle(replays)
-  num_test = int(config.test_ratio * len(replays))
+
+  # Ensure at least one train and one test replay.
+  num_test = 1 + math.ceil(config.test_ratio * (len(replays) - 2))
 
   train_replays = replays[num_test:]
   test_replays = replays[:num_test]
+
+  def add_mirrored(unmirrored: List[ReplayInfo]):
+    mirrored = []
+    for info in unmirrored:
+      mirrored.append(info._replace(mirror=True))
+    unmirrored.extend(mirrored)
+    rng.shuffle(unmirrored)
+
+  # Add mirrored versions of each replay.
+  # We do this here to avoid contamination between train and test sets.
+  if config.mirror:
+    add_mirrored(train_replays)
+    # TODO: test on mirrored too, but keep separate from original test replays.
 
   return train_replays, test_replays
 
@@ -249,10 +283,12 @@ class TrajectoryManager:
       self,
       source: Iterator[ReplayInfo],
       unroll_length: int,
+      encode_name: Callable[[str], int],
       overlap: int = 1,
       compressed: bool = True,
       game_filter: Optional[Callable[[Game], bool]] = None,
       observation_filter: Optional[observations.ObservationFilter] = None,
+      reward_kwargs: dict = {},
   ):
     self.source = source
     self.compressed = compressed
@@ -260,8 +296,11 @@ class TrajectoryManager:
     self.overlap = overlap
     self.game_filter = game_filter or (lambda _: True)
     self.observation_filter = observation_filter
+    self.reward_kwargs = reward_kwargs
+    self.encode_name = encode_name
 
     self.game: Game = None
+    self.reward: np.ndarray = None
     self.frame: int = None
     self.info: ReplayInfo = None
 
@@ -269,6 +308,9 @@ class TrajectoryManager:
     game = read_table(info.path, compressed=self.compressed)
     if info.swap:
       game = swap_players(game)
+    if info.mirror:
+      # Also mirrors the controller inputs, which is what we want.
+      game = mirror_game(game)
     return game
 
   def find_game(self):
@@ -279,6 +321,8 @@ class TrajectoryManager:
         continue
       if not self.game_filter(game):
         continue
+
+      self.reward = reward.compute_rewards(game)
       break
 
     if self.observation_filter is not None:
@@ -288,6 +332,7 @@ class TrajectoryManager:
     self.game = game
     self.frame = 0
     self.info = info
+    self.name_code = self.encode_name(info.main_player.name)
 
   def grab_chunk(self) -> Chunk:
     """Grabs a chunk from a trajectory."""
@@ -307,7 +352,19 @@ class TrajectoryManager:
     states = utils.map_nt(slice, self.game)
     self.frame = end - self.overlap
 
-    return Chunk(states, ChunkMeta(start, end, self.info))
+    # Rewards could be deferred to the learner.
+    rewards = self.reward[start:end - 1]
+    name_codes = np.full([self.unroll_length], self.name_code, np.int32)
+    state_action = StateAction(states, states.p0.controller, name_codes)
+    is_resetting = np.full([self.unroll_length], False)
+    is_resetting[0] = needs_reset
+    frames = Frames(
+        state_action=state_action,
+        reward=rewards,
+        is_resetting=is_resetting,
+    )
+
+    return Chunk(frames, ChunkMeta(start, end, self.info))
 
 def swap_players(game: Game) -> Game:
   return game._replace(p0=game.p1, p1=game.p0)
@@ -325,6 +382,7 @@ def read_table(path: str, compressed: bool) -> Game:
   game_struct = table['root'].combine_chunks()
   return game_array_to_nt(game_struct)
 
+
 class DataSource:
   def __init__(
       self,
@@ -337,6 +395,7 @@ class DataSource:
       # None means all allowed.
       allowed_characters: Optional[list[melee.Character]] = None,
       allowed_opponents: Optional[list[melee.Character]] = None,
+      balance_characters: bool = False,
       name_map: Optional[dict[str, int]] = None,
       observation_config: Optional[observations.ObservationConfig] = None,
   ):
@@ -347,24 +406,12 @@ class DataSource:
     self.damage_ratio = damage_ratio
     self.compressed = compressed
     self.batch_counter = 0
+    self.balance_characters = balance_characters
 
     def build_observation_filter():
       if observation_config is None:
         return None
       return observations.build_observation_filter(observation_config)
-
-    self.replay_counter = 0
-    replays = self.iter_replays()
-    self.managers = [
-        TrajectoryManager(
-            replays,
-            unroll_length=self.chunk_size,
-            overlap=extra_frames,
-            compressed=compressed,
-            game_filter=self.is_allowed,
-            observation_filter=build_observation_filter(),
-        ) for _ in range(batch_size)
-    ]
 
     self.allowed_characters = _charset(allowed_characters)
     self.allowed_opponents = _charset(allowed_opponents)
@@ -372,8 +419,45 @@ class DataSource:
     self.encode_name = nametags.name_encoder(self.name_map)
     self.observation_config = observation_config
 
+    self.replay_counter = 0
+    replay_iter = self.iter_replays()
+    self.managers = [
+        TrajectoryManager(
+            replay_iter,
+            unroll_length=self.chunk_size,
+            overlap=extra_frames,
+            compressed=compressed,
+            game_filter=self.is_allowed,
+            observation_filter=build_observation_filter(),
+            reward_kwargs=dict(damage_ratio=damage_ratio),
+            encode_name=self.encode_name,
+        ) for _ in range(batch_size)
+    ]
+
   def iter_replays(self) -> Iterator[ReplayInfo]:
-    for replay in itertools.cycle(self.replays):
+    replay_iter = itertools.cycle(self.replays)
+
+    if self.balance_characters:
+      # TODO: balance by opponent (i.e. matchup) too?
+      by_character = collections.defaultdict(list)
+      for replay in self.replays:
+        by_character[replay.main_player.character].append(replay)
+
+      num_per_character = {
+          melee.Character(c).name: len(vs)
+          for c, vs in by_character.items()
+      }
+
+      logging.info(f'Character balance: {num_per_character}')
+
+      if len(by_character) > 1:
+        iterators = [itertools.cycle(replays) for replays in by_character.values()]
+        balanced_iterator = utils.interleave(*iterators)
+        replay_iter = utils.interleave(balanced_iterator, replay_iter)
+      else:
+        logging.info("Only one character present, balancing not needed.")
+
+    for replay in replay_iter:
       self.replay_counter += 1
       yield replay
 
@@ -384,27 +468,12 @@ class DataSource:
         and
         game.p1.character[0] in self.allowed_opponents)
 
-  def process_game(
-      self, game: Game, name_code: int, needs_reset: bool) -> Frames:
-    game_length = game_len(game)
-    assert game_length == self.chunk_size
-    # Rewards could be deferred to the learner.
-    rewards = reward.compute_rewards(game, damage_ratio=self.damage_ratio)
-    name_codes = np.full([game_length], name_code, np.int32)
-    state_action = StateAction(game, game.p0.controller, name_codes)
-    is_resetting = np.full([game_length], False)
-    is_resetting[0] = needs_reset
-    return Frames(
-        state_action=state_action, reward=rewards, is_resetting=is_resetting)
-
   def process_batch(self, chunks: list[Chunk]) -> Batch:
     batches: List[Batch] = []
 
     for chunk in chunks:
-      name_code = self.encode_name(chunk.meta.info.main_player.name)
-      needs_reset = chunk.meta.start == 0
       batches.append(Batch(
-          frames=self.process_game(chunk.states, name_code, needs_reset),
+          frames=chunk.frames,
           count=self.batch_counter,
           meta=chunk.meta))
 
@@ -413,19 +482,20 @@ class DataSource:
   def __next__(self) -> Tuple[Batch, float]:
     batch: Batch = self.process_batch(
         [m.grab_chunk() for m in self.managers])
+    # TODO: the epoch isn't quite correct if we are balancing replays
     epoch = self.replay_counter / len(self.replays)
     self.batch_counter += 1
     assert batch.frames.state_action.state.stage.shape[-1] == self.chunk_size
     assert batch.frames.reward.shape[-1] == self.chunk_size - 1
     return batch, epoch
 
-def produce_batches(data_source_kwargs, batch_queue):
+def produce_batches(data_source_kwargs: dict, batch_queue: mp.Queue):
   data_source = DataSource(**data_source_kwargs)
   while True:
     batch_queue.put(next(data_source))
 
 class DataSourceMP:
-  def __init__(self, buffer=4, **kwargs):
+  def __init__(self, buffer=16, **kwargs):
     for k, v in kwargs.items():
       if k == 'replays':
         continue
@@ -459,9 +529,10 @@ class MultiDataSourceMP:
       **kwargs,
   ):
     if num_workers > len(replays):
-      raise ValueError(
-          f"num_workers ({num_workers}) must be less than the number of "
-          f"replays ({len(replays)})")
+      num_workers = len(replays)
+      logging.warning(
+          f"num_workers reduced to {num_workers} since there are only "
+          f"{len(replays)} replays.")
 
     if batch_size % num_workers != 0:
       raise ValueError(
@@ -485,6 +556,16 @@ class MultiDataSourceMP:
     batches, epochs = zip(*results)
     return utils.concat_nest_nt(batches), np.mean(epochs)
 
+class CachedDataSource(DataSource):
+  """Guaranteed fast, useful for performance benchmarking."""
+
+  @functools.cache
+  def _get_batch(self) -> tuple[Batch, float]:
+    return super().__next__()
+
+  def __next__(self) -> Tuple[Batch, float]:
+    return self._get_batch()
+
 @dataclasses.dataclass
 class DataConfig:
   batch_size: int = 32
@@ -492,19 +573,28 @@ class DataConfig:
   damage_ratio: float = 0.01
   compressed: bool = True
   num_workers: int = 0
+  balance_characters: bool = False
+  cached: bool = False
 
 def make_source(
     num_workers: int,
+    cached: bool = False,
     **kwargs):
   if num_workers == 0:
+    if cached:
+      return CachedDataSource(**kwargs)
+
     return DataSource(**kwargs)
+
+  if num_workers == 1:
+    return DataSourceMP(**kwargs)
 
   return MultiDataSourceMP(num_workers=num_workers, **kwargs)
 
 def toy_data_source(**kwargs) -> DataSource:
   dataset_config = DatasetConfig(
-      data_dir=paths.TOY_DATA_DIR,
-      meta_path=paths.TOY_META_PATH,
+      data_dir=str(paths.TOY_DATA_DIR),
+      meta_path=str(paths.TOY_META_PATH),
   )
   return DataSource(
       replays=replays_from_meta(dataset_config),

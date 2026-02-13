@@ -1,14 +1,14 @@
 import abc
-from typing import Any, Optional, Tuple
+import copy
+from typing import Optional, Tuple
 
 import tree
 import sonnet as snt
 import tensorflow as tf
-from tensorflow import Tensor
 
 from slippi_ai import tf_utils
 
-RecurrentState = tree.Structure[tf.Tensor]
+RecurrentState = tree.StructureKV[str, tf.Tensor]
 Inputs = tf.Tensor
 
 class Network(snt.Module, abc.ABC):
@@ -176,6 +176,9 @@ class LayerNorm(snt.Module):
   @snt.once
   def _initialize(self, inputs):
     feature_shape = inputs.shape[-1:]
+    if feature_shape[0] == 1:
+      raise ValueError('LayerNorm cannot be applied to scalar features.')
+
     self.scale = tf.Variable(
         tf.ones(feature_shape, dtype=inputs.dtype),
         name='scale')
@@ -435,6 +438,11 @@ DEFAULT_CONFIG = dict(
     res_lstm=DeepResLSTM.CONFIG,
     tx_like=TransformerLike.CONFIG,
 )
+
+# Warning: use this method to get a fresh copy of the default config
+# when using as a dataclass field default value.
+def default_config() -> dict:
+  return copy.deepcopy(DEFAULT_CONFIG)
 
 def construct_network(name, **config):
   return CONSTRUCTORS[name](**config[name])

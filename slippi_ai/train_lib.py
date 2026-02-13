@@ -1,12 +1,15 @@
 """Train (and test) a network via imitation learning."""
 
 import collections
+import contextlib
 import dataclasses
 import datetime
 import json
 import os
 import pickle
+import queue
 import secrets
+import threading
 import time
 import typing as tp
 
@@ -17,6 +20,8 @@ import tensorflow as tf
 import tree
 
 import wandb
+
+import melee
 
 from slippi_ai import (
     controller_heads,
@@ -47,6 +52,7 @@ class TrainManager:
       learner: learner_lib.Learner,
       data_source: data_lib.DataSource,
       step_kwargs={},
+      prefetch: int = 16,
   ):
     self.learner = learner
     self.data_source = data_source
@@ -54,15 +60,52 @@ class TrainManager:
     self.step_kwargs = step_kwargs
     self.data_profiler = utils.Profiler()
     self.step_profiler = utils.Profiler()
+    self.last_epoch = 0.
 
-  def step(self, compiled: bool = True) -> tuple[dict, data_lib.Batch]:
-    with self.data_profiler:
+    self.frames_queue = queue.Queue(maxsize=prefetch)
+    self.stop_requested = threading.Event()
+
+    self.data_thread = threading.Thread(target=self.produce_frames)
+    self.data_thread.start()
+
+  def produce_frames(self):
+    while not self.stop_requested.is_set():
       batch, epoch = next(self.data_source)
+      frames = batch.frames
+
+      if np.any(frames.is_resetting[:, 1:]):
+        raise ValueError("Unexpected mid-episode reset.")
+
+      frames = frames._replace(
+          state_action=self.learner.policy.embed_state_action.from_state(
+              frames.state_action))
+      frames = utils.map_nt(tf.convert_to_tensor, frames)
+      data = (batch, epoch, frames)
+
+      # Try to put data into the queue, but check for stop_requested
+      while not self.stop_requested.is_set():
+        try:
+          self.frames_queue.put(data, timeout=1)
+          break
+        except queue.Full:
+          continue
+
+  def stop(self):
+    self.stop_requested.set()
+    self.data_thread.join()
+
+  def step(self, compiled: tp.Optional[bool] = None) -> tuple[dict, data_lib.Batch]:
+    with self.data_profiler:
+      frames_queue_size = self.frames_queue.qsize()
+      batch, epoch, frames = self.frames_queue.get()
     with self.step_profiler:
       stats, self.hidden_state = self.learner.step(
-          batch, self.hidden_state, compile=compiled, **self.step_kwargs)
+          frames, self.hidden_state, compile=compiled, **self.step_kwargs)
+
+    self.last_epoch = epoch
     stats.update(
         epoch=epoch,
+        frames_queue_size=frames_queue_size,
     )
     return stats, batch
 
@@ -106,14 +149,15 @@ class RuntimeConfig:
   log_interval: int = 10  # seconds between logging
   save_interval: int = 300  # seconds between saving to disk
 
-  eval_every_n: int = 100  # number of training steps between evaluations
-  num_eval_steps: int = 10  # number of batches per evaluation
+  num_evals_per_epoch: float = 1  # number evaluations per training epoch
+  eval_at_start: bool = False  # do an eval at the start of training
+  num_eval_epochs: float = 1  # number of test-set epochs per evaluation
 
 @dataclasses.dataclass
 class ValueFunctionConfig:
   train_separate_network: bool = True
   separate_network_config: bool = True
-  network: dict = _field(lambda: networks.DEFAULT_CONFIG)
+  network: dict = _field(networks.default_config)
 
 @dataclasses.dataclass
 class Config:
@@ -126,8 +170,8 @@ class Config:
   learner: learner_lib.LearnerConfig = _field(learner_lib.LearnerConfig)
 
   # TODO: turn these into dataclasses too
-  network: dict = _field(lambda: networks.DEFAULT_CONFIG)
-  controller_head: dict = _field(lambda: controller_heads.DEFAULT_CONFIG)
+  network: dict = _field(networks.default_config)
+  controller_head: dict = _field(controller_heads.default_config)
 
   embed: embed_lib.EmbedConfig = _field(embed_lib.EmbedConfig)
 
@@ -174,6 +218,10 @@ def create_name_map(
   return name_map
 
 def train(config: Config):
+  with contextlib.ExitStack() as exit_stack:
+    _train(config, exit_stack)
+
+def _train(config: Config, exit_stack: contextlib.ExitStack):
   tag = config.tag or train_lib.get_experiment_tag()
   # Might want to use wandb.run.dir instead, but it doesn't seem
   # to be set properly even when we try to override it.
@@ -183,8 +231,6 @@ def train(config: Config):
     os.makedirs(expt_dir, exist_ok=True)
   config.expt_dir = expt_dir  # for wandb logging
   logging.info('experiment directory: %s', expt_dir)
-
-  runtime = config.runtime
 
   pickle_path = os.path.join(expt_dir, 'latest.pkl')
 
@@ -218,12 +264,18 @@ def train(config: Config):
       best_eval_loss = float('inf')  # Old losses don't apply to new delay.
 
     # These we can't change after the fact.
-    for key in ['network', 'controller_head', 'embed']:
+    for key in ['network', 'controller_head', 'embed', 'value_function']:
       current = getattr(config, key)
       previous = getattr(restore_config, key)
       if current != previous:
         logging.warning(f'Requested {key} config doesn\'t match, overriding from checkpoint.')
         setattr(config, key, previous)
+
+    if (config.dataset.allowed_characters != restore_config.dataset.allowed_characters or
+        config.dataset.allowed_opponents != restore_config.dataset.allowed_opponents):
+      logging.warning('Dataset character/opponent filters changed, resetting best eval loss.')
+      best_eval_loss = float('inf')
+      config.runtime.eval_at_start = True
 
   policy = saving.policy_from_config(dataclasses.asdict(config))
 
@@ -263,6 +315,13 @@ def train(config: Config):
   train_replays, test_replays = data_lib.train_test_split(dataset_config)
   logging.info(f'Training on {len(train_replays)} replays, testing on {len(test_replays)}')
 
+  character_quantities = collections.Counter()
+  for replay in train_replays:
+    character_quantities[melee.Character(replay.main_player.character)] += 1
+  dataset_metrics = {
+      'characters': dict(character_quantities),
+  }
+
   if restored:
     name_map: dict[str, int] = combined_state['name_map']
   else:
@@ -289,14 +348,32 @@ def train(config: Config):
       **char_filters,
   )
   train_data = data_lib.make_source(replays=train_replays, **data_config)
-  test_data = data_lib.make_source(replays=test_replays, **data_config)
+
+  test_batch_size = 2 * config.data.batch_size
+  test_data_config = dict(
+      data_config,
+      # Use more workers for test data to keep up with eval speed.
+      num_workers=2 * config.data.num_workers,
+      batch_size=test_batch_size,
+  )
+  test_data = data_lib.make_source(replays=test_replays, **test_data_config)
   del train_replays, test_replays  # free up memory
 
   train_manager = train_lib.TrainManager(learner, train_data, dict(train=True))
   test_manager = train_lib.TrainManager(learner, test_data, dict(train=False))
 
+  # TrainManager should probably be a proper context manager.
+  exit_stack.callback(train_manager.stop)
+  exit_stack.callback(test_manager.stop)
+
+  runtime = config.runtime
+
   # initialize variables
+  if config.learner.minibatch_size > 0:
+    # TODO: figure out why this is needed when minibatching is on
+    test_manager.step()
   train_stats, _ = train_manager.step()
+  logging.info('Initialized policy with %d variables', len(policy.variables))
   logging.info('loss initial: %f', _get_loss(train_stats))
 
   with tf.device('/cpu:0'):
@@ -331,6 +408,7 @@ def train(config: Config):
         config=dataclasses.asdict(config),
         name_map=name_map,
         best_eval_loss=eval_loss if eval_loss is not None else best_eval_loss,
+        dataset_metrics=dataset_metrics,
     )
     pickled_state = pickle.dumps(combined_state)
 
@@ -397,37 +475,68 @@ def train(config: Config):
           f' step={step_time:.3f}')
     print()
 
-  def maybe_eval():
-    nonlocal best_eval_loss  # Allow modification of the best_eval_loss variable
-    total_steps = int(step.numpy())
-    if total_steps % runtime.eval_every_n != 0:
-      return
+  allowed_characters = data_lib.chars_from_string(
+      config.dataset.allowed_characters)
+  if allowed_characters is None:
+    allowed_characters = list(melee.Character)
 
-    eval_stats = []
+  last_train_epoch_evaluated = 0.
+  needs_initial_eval = runtime.eval_at_start
+
+  def maybe_eval():
+    nonlocal best_eval_loss
+    nonlocal last_train_epoch_evaluated
+    nonlocal needs_initial_eval
+
+    # Check whether we need to run an evaluation
+    train_epoch = train_manager.last_epoch
+    if (
+      (train_epoch - last_train_epoch_evaluated) * runtime.num_evals_per_epoch < 1
+      and not needs_initial_eval):
+      return
+    last_train_epoch_evaluated = train_epoch
+    needs_initial_eval = False
+
+    per_step_eval_stats: list[dict] = []
     metas: list[data_lib.ChunkMeta] = []
 
     def time_mean(x):
       # Stats are either scalars or (time, batch)-shaped.
       x = tf_utils.to_numpy(x)
-      if isinstance(x, float) or len(x.shape) == 0:
-        return x
 
-      return np.mean(x, axis=0)
+      if isinstance(x, np.ndarray):
+        if len(x.shape) == 0:
+          return x.item()
 
-    for _ in range(runtime.num_eval_steps):
+        return np.mean(x, axis=0)
+
+      return x
+
+    logging.info('Starting evaluation at train epoch %.3f', train_epoch)
+    start_time = time.perf_counter()
+    test_epoch = test_manager.last_epoch
+    while (test_manager.last_epoch - test_epoch) < runtime.num_eval_epochs:
       stats, batch = test_manager.step()
 
       # Convert to numpy and take time-mean to free up memory.
       stats = utils.map_single_structure(time_mean, stats)
 
-      eval_stats.append(stats)
+      per_step_eval_stats.append(stats)
       metas.append(batch.meta)
 
-    eval_stats = tf.nest.map_structure(utils.stack, *eval_stats)
+    eval_time = time.perf_counter() - start_time
+
+    # [eval_steps, batch_size], mean taken over time
+    eval_stats = utils.batch_nest_nt(per_step_eval_stats)
 
     data_time = test_manager.data_profiler.mean_time()
     step_time = test_manager.step_profiler.mean_time()
 
+    sps = len(per_step_eval_stats) / eval_time
+    frames_per_step = test_batch_size * config.data.unroll_length
+    mps = sps * frames_per_step / FRAMES_PER_MINUTE
+
+    total_steps = int(step.numpy())
     total_frames = total_steps * FRAMES_PER_STEP
     train_epoch = epoch_tracker.last
     counters = dict(
@@ -435,14 +544,18 @@ def train(config: Config):
         train_epoch=train_epoch,
         data_time=data_time,
         step_time=step_time,
+        sps=sps,
+        mps=mps,
     )
 
-    to_log = dict(eval=eval_stats, **counters)
-    train_lib.log_stats(to_log, total_steps)
+    to_log = dict(
+        counters,
+        eval=utils.map_nt(mean, eval_stats),
+    )
 
     # Calculate the mean eval loss
     eval_loss = eval_stats['policy']['loss'].mean()
-    logging.info('eval loss: %.4f data: %.3f step: %.3f', eval_loss, data_time, step_time)
+    logging.info('eval loss: %.4f data: %.3f step: %.3f mps: %.1f', eval_loss, data_time, step_time, mps)
 
     # Save if the eval loss is the best so far
     if eval_loss < best_eval_loss:
@@ -450,18 +563,15 @@ def train(config: Config):
       best_eval_loss = eval_loss
       save(eval_loss=best_eval_loss)
 
-    # Log losses aggregated by name.
-
     # Stats have shape [num_eval_steps, batch_size]
     loss = eval_stats['policy']['loss']
-    assert loss.shape == (runtime.num_eval_steps, config.data.batch_size)
+    assert loss.shape == (len(per_step_eval_stats), test_batch_size)
 
-    meta: data_lib.ChunkMeta = tf.nest.map_structure(utils.stack, *metas)
+    meta = utils.batch_nest_nt(metas)
 
     # Name of the player we're imitating.
-    name = np.where(
-        meta.info.swap, meta.info.meta.p1.name, meta.info.meta.p0.name)
-    encoded_name = batch_encode_name(name)
+    name = meta.info.main_player.name
+    encoded_name: np.ndarray = batch_encode_name(name)
     assert encoded_name.dtype == np.uint8
     assert encoded_name.shape == loss.shape
 
@@ -471,18 +581,34 @@ def train(config: Config):
       loss_sums_and_counts.append((np.sum(loss * mask), np.sum(mask)))
 
     losses, counts = zip(*loss_sums_and_counts)
-    to_log = dict(
+    to_log['eval_names'] = dict(
         losses=np.array(losses, dtype=np.float32),
         counts=np.array(counts, dtype=np.uint32),
     )
 
-    to_log = dict(eval_names=to_log, **counters)
-    train_lib.log_stats(to_log, total_steps, take_mean=False)
+    # Log losses aggregated by character
+    if len(allowed_characters) > 1:
+      characters = meta.info.main_player.character
+      per_character_loss_sums = {}
+      per_character_loss_counts = {}
+      for character in allowed_characters:
+        mask = character.value == characters
+        name = character.name.lower()
+        per_character_loss_sums[name] = np.sum(loss * mask)
+        per_character_loss_counts[name] = np.sum(mask)
+
+      to_log['eval_characters'] = dict(
+          losses=per_character_loss_sums,
+          counts=per_character_loss_counts,
+      )
+
+    log_stats(to_log, total_steps, take_mean=False)
 
   start_time = time.time()
 
   while time.time() - start_time < runtime.max_runtime:
+    maybe_eval()
+
     train_stats, _ = train_manager.step()
     step.assign_add(1)
     maybe_log(train_stats)
-    maybe_eval()

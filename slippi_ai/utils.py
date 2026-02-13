@@ -124,7 +124,7 @@ def map_nt(f, *nt: T) -> T:
   if t is tuple:
     return tuple([map_nt(f, *vs) for vs in zip(*nt)])
   if issubclass(t, tuple):
-    return t(*[map_nt(f, *vs) for vs in zip(*nt)])
+    return t(*(map_nt(f, *vs) for vs in zip(*nt)))
   if issubclass(t, dict):
     return {k: map_nt(f, *[v[k] for v in nt]) for k in nt[0].keys()}
   if t is list:
@@ -139,6 +139,18 @@ def batch_nest_nt(nests: tp.Sequence[T]) -> T:
 def concat_nest_nt(nests: tp.Sequence[T], axis: int = 0) -> T:
   # More efficient than batch_nest
   return map_nt(lambda *xs: np.concatenate(xs, axis), *nests)
+
+def flatten_up_to(shallow_structure, input_structure, acc: list | None = None) -> list:
+  if acc is None:
+    acc = []
+
+  if isinstance(shallow_structure, (tuple, list)):
+    for s, i in zip(shallow_structure, input_structure):
+      flatten_up_to(s, i, acc)
+  else:
+    acc.append(input_structure)
+
+  return acc
 
 def unbatch_nest(nest: T) -> list[T]:
   return [
@@ -218,12 +230,15 @@ def retry(
   # Let any exception pass through on the last attempt.
   return f()
 
-def is_structure(obj_or_type) -> bool:
-  check_fn = issubclass if isinstance(obj_or_type, type) else isinstance
-  return check_fn(obj_or_type, (tp.Mapping, tp.Sequence))
+def is_structure(type_: type) -> bool:
+  assert isinstance(type_, type), f'Expected type, got {type_}'
+  return issubclass(type_, (tp.Mapping, tp.Sequence, np.ndarray))
 
 def is_namedtuple(t: type) -> bool:
   return hasattr(t, '_fields')
+
+def is_sequence(t: type) -> bool:
+  return issubclass(t, (tp.Sequence, np.ndarray))
 
 def _check_same_structure(
     s1, s2, equal: bool = False) -> list[tuple[list, str]]:
@@ -268,8 +283,34 @@ def _check_same_structure(
       errors.extend(sub_errors)
     return errors
 
-  if isinstance(s1, tp.Sequence):
-    assert isinstance(s2, tp.Sequence)
+  if isinstance(s1, np.ndarray) and isinstance(s2, np.ndarray):
+    if not equal:
+      return errors
+
+    if s1.shape != s2.shape:
+      errors.append(([], f'shape mismatch: {s1.shape} != {s2.shape}'))
+      return errors
+
+    if s1.dtype != s2.dtype:
+      errors.append(([], f'dtype mismatch: {s1.dtype} != {s2.dtype}'))
+      return errors
+
+    if len(s1.shape) == 1:
+      neq_indices = np.arange(s1.shape[0])[s1 != s2]
+      for i in neq_indices:
+        errors.append(([i], f'array mismatch: {s1[i]} != {s2[i]}'))
+      return errors
+
+    if not np.array_equal(s1, s2):
+      errors.append(([], f'array mismatch: {s1} != {s2}'))
+      return errors
+
+    return errors
+
+  if is_sequence(t1):
+    if not is_sequence(t2):
+      errors.append(([], f'type mismatch: {t1} and {t2}'))
+      return errors
 
     if len(s1) != len(s2):
       errors.append(([], f'different lengths: {len(s1)} != {len(s2)}'))
@@ -280,6 +321,7 @@ def _check_same_structure(
       for path, _ in sub_errors:
         path.append(i)
       errors.extend(sub_errors)
+
     return errors
 
   if equal and (s1 != s2):
@@ -293,6 +335,15 @@ def check_same_structure(
   for path, _ in errors:
     path.reverse()
   return errors
+
+def interleave(*iterables: tp.Iterable[T]) -> tp.Iterator[T]:
+  iterators = [iter(it) for it in iterables]
+  while iterators:
+    for it in list(iterators):
+      try:
+        yield next(it)
+      except StopIteration:
+        iterators.remove(it)
 
 def find_open_udp_ports(num: int):
   min_port = 10_000

@@ -92,16 +92,21 @@ class AgentConfig:
     return kwargs
 
   def check_allowed_chars(self, state: dict):
-    if not self.char:
-      return
-
     allowed_chars = eval_lib.allowed_characters(state['config'])
+
     if allowed_chars is None:  # None means all are allowed
+      if self.char is None:
+        raise ValueError('Character must be specified if teacher allows all.')
       return
 
-    for char in self.char:
-      if char not in allowed_chars:
-        raise ValueError(f'Character {char} not in {allowed_chars}')
+    # Default to all characters used during imitation
+    if self.char is None:
+      self.char = allowed_chars
+      logging.info(f'Training on {[c.name for c in self.char]}')
+    else:
+      for char in self.char:
+        if char not in allowed_chars:
+          raise ValueError(f'Character {char} not in {allowed_chars}')
 
 class OpponentType(enum.Enum):
   CPU = 'cpu'
@@ -206,8 +211,7 @@ class LearnerManager:
 
     if self._config.opponent.should_train():
       ports = [self._port, self._enemy_port]
-      trajectories = [trajectories[p] for p in ports]
-      trajectory = evaluators.Trajectory.batch(trajectories)
+      trajectory = evaluators.Trajectory.batch([trajectories[p] for p in ports])
     else:
       trajectory = trajectories[self._port]
 
@@ -295,6 +299,9 @@ def run(config: Config):
     os.makedirs(expt_dir, exist_ok=True)
   logging.info('experiment directory: %s', expt_dir)
 
+  if config.agent.path is not None:
+    raise ValueError('Main agent path is not used, use `restore` instead')
+
   # Restore from existing save file if it exists.
   restore_path = None
   restore_from_checkpoint = False
@@ -322,6 +329,7 @@ def run(config: Config):
           f'{config.restore} (requested) != {previous_config.restore} (checkpoint)')
 
     previous_teacher = previous_config.teacher
+    assert previous_teacher is not None
 
     if config.teacher and config.teacher != previous_teacher:
       assert restore_from_checkpoint
@@ -338,7 +346,7 @@ def run(config: Config):
     if rl_delay != teacher_delay:
       raise ValueError(
           'Teacher delay does not match RL state delay: '
-          f'{teacher_delay} != {rl_delay}. Using teacher delay.')
+          f'{teacher_delay} != {rl_delay}.')
 
     step = rl_state['step']
   elif config.teacher:
@@ -395,9 +403,6 @@ def run(config: Config):
     opponent_players = [dolphin_lib.CPU() for _ in range(batch_size)]
   else:
     opponent_players = [dolphin_lib.AI() for _ in range(batch_size)]
-
-  if config.agent.path is not None:
-    raise ValueError('Main agent path is not used, use `restore` instead')
 
   main_agent_kwargs = config.agent.get_kwargs()
   config.agent.check_allowed_chars(rl_state)
@@ -517,7 +522,7 @@ def run(config: Config):
       # We don't log mirror matches as the ko_diff will be 0.
 
     def get_name_matchup_stats(states: Game) -> dict:
-      tm_kos = reward.compute_rewards(states, damage_ratio=0)  # [T, P, B]
+      tm_kos = reward.ko_diff(states)  # [T, P, B]
       bm_kos = tm_kos.mean(axis=(0, 1))  # [B]
 
       stats = {}
@@ -556,7 +561,7 @@ def run(config: Config):
       # We don't log mirror matches as the ko_diff will be 0.
 
     def get_char_matchup_stats(states: Game) -> dict:
-      tm_kos = reward.compute_rewards(states, damage_ratio=0)  # [T, P, B]
+      tm_kos = reward.ko_diff(states)  # [T, P, B]
       bm_kos = tm_kos.mean(axis=(0, 1))  # [B]
 
       stats = {}
@@ -658,12 +663,8 @@ def run(config: Config):
 
   maybe_flush = utils.Periodically(flush, config.runtime.log_interval)
 
-  # The OpponentType enum sadly needs to be converted.
-  rl_config_jsonnable = dataclasses.asdict(config)
-  rl_config_jsonnable = tf.nest.map_structure(
-      lambda x: x.value if isinstance(x, enum.Enum) else x,
-      rl_config_jsonnable
-  )
+  # TODO: better versioning for the RL config
+  rl_config_dict = dataclasses.asdict(config)
 
   def save(step: int):
     # Note: this state is valid as an imitation state.
@@ -672,7 +673,7 @@ def run(config: Config):
         config=teacher_state['config'],
         name_map=teacher_state['name_map'],
         step=step,
-        rl_config=rl_config_jsonnable,
+        rl_config=rl_config_dict,
     )
     pickled_state = pickle.dumps(combined_state)
 

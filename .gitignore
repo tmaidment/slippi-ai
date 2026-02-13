@@ -152,3 +152,4 @@ saved_models/
 pickled_models/
 checkpoints/
 stripped_models/
+test_models/

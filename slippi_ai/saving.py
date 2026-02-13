@@ -1,7 +1,6 @@
 import dataclasses
 import pickle
 
-from absl import logging
 import tree
 
 from slippi_ai import (
@@ -11,9 +10,16 @@ from slippi_ai import (
     networks,
     controller_heads,
     embed,
+    data,
 )
+from slippi_ai.flag_utils import dataclass_from_dict
 
-VERSION = 4
+# v2: Added value function config
+# v3: Added embed config
+# v4: Added observation config
+# v5: Added randall, fod, items to embed config
+
+VERSION = 5
 
 def upgrade_config(config: dict):
   """Upgrades a config to the latest version."""
@@ -24,7 +30,6 @@ def upgrade_config(config: dict):
       train_value_head=False,
     )
     config['version'] = 1
-    logging.warning('Upgraded config to version 1')
 
   if config['version'] == 1:
     if 'value_function' not in config:
@@ -33,7 +38,6 @@ def upgrade_config(config: dict):
       )
 
     config['version'] = 2
-    logging.warning('Upgraded config version 1 -> 2')
 
   if config['version'] == 2:
     assert 'embed' not in config
@@ -48,18 +52,34 @@ def upgrade_config(config: dict):
         controller=embed.ControllerConfig(
             axis_spacing=16,
             shoulder_spacing=4,
-        )
+        ),
     )
     config['embed'] = dataclasses.asdict(old_embed_config)
     config['version'] = 3
-    logging.warning('Upgraded config version 2 -> 3')
 
   if config['version'] == 3:
     assert 'observation' not in config
     config['observation'] = dataclasses.asdict(
         observations.NULL_OBSERVATION_CONFIG)
     config['version'] = 4
-    logging.warning('Upgraded config version 3 -> 4')
+
+  if config['version'] == 4:
+    old_items_config = embed.ItemsConfig(type=embed.ItemsType.SKIP)
+    config['embed'].update(
+        with_randall=False,
+        with_fod=False,
+        items=dataclasses.asdict(old_items_config),
+    )
+    config['embed']['player'].update(
+        with_nana=False,
+        legacy_jumps_left=True,
+    )
+    config['version'] = 5
+
+  # Everything else is handled by the defaults in train_lib.Config
+  from slippi_ai.train_lib import Config  # avoid circular import
+  config_dc = dataclass_from_dict(Config, config)
+  config = dataclasses.asdict(config_dc)
 
   assert config['version'] == VERSION
   return config
@@ -96,7 +116,12 @@ def policy_from_config(config: dict) -> policies.Policy:
       embed_controller=embed.get_controller_embedding(
           **config['embed']['controller']),
       embed_game=embed.make_game_embedding(
-          player_config=config['embed']['player']),
+          player_config=config['embed']['player'],
+          with_randall=config['embed']['with_randall'],
+          with_fod=config['embed']['with_fod'],
+          items_config=dataclass_from_dict(
+              embed.ItemsConfig, config['embed']['items']),
+      ),
       **config['policy'],
   )
 
@@ -111,7 +136,6 @@ def load_policy_from_state(state: dict) -> policies.Policy:
       policy.variables, params)
 
   return policy
-
 
 
 def load_state_from_disk(path: str) -> dict:

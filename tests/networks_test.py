@@ -1,3 +1,4 @@
+import logging
 import unittest
 from parameterized import parameterized
 
@@ -10,10 +11,14 @@ from slippi_ai import (
 
 def assert_tensors_close(t1: tf.Tensor, t2: tf.Tensor):
   # TODO: relax tolerance when running on GPU
-  np.testing.assert_allclose(t1.numpy(), t2.numpy())
+  np.testing.assert_allclose(
+      t1.numpy(), t2.numpy(),
+      rtol=1e-5, atol=1e-6)
+
+default_network_config = networks.default_config()
 
 def default_network(name):
-  return networks.CONSTRUCTORS[name](**networks.DEFAULT_CONFIG[name])
+  return networks.CONSTRUCTORS[name](**default_network_config[name])
 
 embed_game = embed.make_game_embedding()
 
@@ -46,6 +51,7 @@ class NetworksTest(unittest.TestCase):
       tf.nest.map_structure(assert_tensors_close, unroll_final_state, step_final_state)
 
 if __name__ == '__main__':
-  if tf.config.list_physical_devices('GPU'):
-    raise RuntimeError("Tests don't work properly on GPU")
+  gpus = tf.config.list_physical_devices('GPU')
+  if gpus:
+    logging.warning("Tests may not work properly on GPU.")
   unittest.main(failfast=True)

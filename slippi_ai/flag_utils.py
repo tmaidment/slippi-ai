@@ -1,6 +1,7 @@
 import enum
 import dataclasses
 import typing as tp
+import types
 
 from absl import flags
 from absl import logging
@@ -12,15 +13,20 @@ T = tp.TypeVar('T')
 Item = tp.Union[ff.Item, MultiItem]
 ItemConstructor = tp.Callable[[tp.Any], Item]
 
-TYPE_TO_ITEM: dict[type, ItemConstructor] = {
+Type = type | types.GenericAlias
+
+TYPE_TO_ITEM: dict[Type, ItemConstructor] = {
     bool: ff.Boolean,
     int: ff.Integer,
     str: ff.String,
     float: ff.Float,
+
+    # TODO: decide whether to handle these here or in handle_list
     list[str]: ff.StringList,
+    tuple[int, ...]: ff.Sequence,
 }
 
-def maybe_undo_optional(t: type) -> type:
+def maybe_undo_optional(t: Type) -> Type:
   if (
       hasattr(t, '__origin__') and
       t.__origin__ is tp.Union and
@@ -30,7 +36,7 @@ def maybe_undo_optional(t: type) -> type:
     return t.__args__[0]
   return t
 
-def undo_list(t: type) -> tp.Optional[type]:
+def undo_list(t: Type) -> tp.Optional[Type]:
   if (
       hasattr(t, '__origin__') and
       t.__origin__ is list
@@ -38,28 +44,35 @@ def undo_list(t: type) -> tp.Optional[type]:
     return t.__args__[0]
   return None
 
-def handle_list(field_type: type, default: tp.Any) -> tp.Optional[Item]:
+def _issubclass(cls: Type, class_or_tuple: tp.Union[type, tuple[type, ...]]) -> bool:
+  """Like issubclass but works generics like dict[int, str]."""
+  if isinstance(cls, types.GenericAlias):
+    cls = cls.__origin__
+
+  return issubclass(cls, class_or_tuple)
+
+def handle_list(field_type: Type, default: tp.Any) -> tp.Optional[Item]:
   base_type = undo_list(field_type)
   if base_type is None:
     return None
 
-  if issubclass(base_type, enum.Enum):
+  if _issubclass(base_type, enum.Enum):
     return ff.MultiEnumClass(
         default=default,
         enum_class=base_type,
     )
 
-  if issubclass(base_type, (int, float, str)):
+  if _issubclass(base_type, (int, float, str)):
     return ff.Sequence(default=default)
 
   return None
 
-def get_leaf_flag(field_type: type, default: tp.Any) -> tp.Optional[Item]:
+def get_leaf_flag(field_type: Type, default: tp.Any) -> tp.Optional[Item]:
   field_type = maybe_undo_optional(field_type)
   item_constructor = TYPE_TO_ITEM.get(field_type)
   if item_constructor is not None:
     return item_constructor(default)
-  elif issubclass(field_type, enum.Enum):
+  elif _issubclass(field_type, enum.Enum):
     return ff.EnumClass(
         default=default,
         enum_class=field_type,
@@ -73,9 +86,10 @@ def get_leaf_flag(field_type: type, default: tp.Any) -> tp.Optional[Item]:
   logging.warn(f'Unsupported field of type {field_type}')
   return None
 
-def is_leaf(type_: type) -> bool:
+def is_leaf(type_: Type) -> bool:
   type_ = maybe_undo_optional(type_)
-  if issubclass(type_, dict) or dataclasses.is_dataclass(type_):
+
+  if _issubclass(type_, dict) or dataclasses.is_dataclass(type_):
     return False
   return True
 
@@ -108,7 +122,7 @@ def _get_default(field: dataclasses.Field):
     return field.default_factory()
   if field.default is not dataclasses.MISSING:
     return field.default
-  return None
+  return dataclasses.MISSING
 
 
 def get_flags_from_dataclass(cls: type) -> tree.Structure[ff.Item]:
@@ -118,12 +132,20 @@ def get_flags_from_dataclass(cls: type) -> tree.Structure[ff.Item]:
   result = {}
 
   for field in dataclasses.fields(cls):
+    field_default = _get_default(field)
     if dataclasses.is_dataclass(field.type):
-      result[field.name] = get_flags_from_dataclass(field.type)
+      if field_default is dataclasses.MISSING:
+        result[field.name] = get_flags_from_dataclass(field.type)
+      else:
+        result[field.name] = get_flags_from_default(field_default)
     elif field.type is dict:
-      result[field.name] = get_flags_from_default(_get_default(field))
+      if field_default is dataclasses.MISSING:
+        raise ValueError(f'Field {cls.__name__}.{field.name} is a dict but has no default value')
+      result[field.name] = get_flags_from_default(field_default)
     else:
-      item = get_leaf_flag(field.type, _get_default(field))
+      if field_default is dataclasses.MISSING:
+        raise ValueError(f'Field {cls.__name__}.{field.name} has no default value')
+      item = get_leaf_flag(field.type, field_default)
       if item is not None:
         result[field.name] = item
 

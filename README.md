@@ -19,6 +19,8 @@ python scripts/eval_two.py --dolphin.iso <path/to/ssbm.iso> --p1.type human --p2
 python scripts/eval_two.py --help  # to get a full list of options
 ```
 
+A model capable of playing 12 different characters is available [here](https://www.dropbox.com/scl/fi/lpi9krfei1knfvfw7up7v/medium-v2?rlkey=qmah3qfz5anwva93x48zcx01k&st=sxo8hbeb&dl=0). You can change the character by setting `--p2.character <fox/falco/marth/...>`.
+
 #### Notes
 * Tested with python 3.10 and 3.11.
 * By default phillip sets up human players as using Wii-U controller adapters. If you want to use your own dolphin configuration (including controller config) pass `--dolphin.copy_home_directory`. You still need to specify which player (p1 or p2) is human.
@@ -48,8 +50,6 @@ Phillip is trained in two stages. In the first stage, it learns to imitate human
 ## Creating a Dataset
 
 The first step is preprocess your slippi replays using [`slippi_db/parse_local.py`](https://github.com/vladfi1/slippi-ai/blob/main/slippi_db/parse_local.py). See the documentation in that file for more details.
-
-Note: local parsing currently depends on [peppi-py](https://github.com/hohav/peppi-py) version [0.6.0](https://github.com/hohav/peppi-py/commit/8c02a4659c3302321dfbfcf2093c62f634e335f7) which you may need to build manually.
 
 The output of this step will be a `Parsed` directory of preprocessed games and a `meta.json` metadata file.
 

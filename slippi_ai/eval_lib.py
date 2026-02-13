@@ -1,8 +1,7 @@
 import contextlib
 import enum
-import dataclasses
-import enum
 import functools
+import dataclasses
 import logging
 import os
 import threading, queue
@@ -17,11 +16,12 @@ import melee
 
 from slippi_ai import (
   embed, policies, dolphin, saving, data, utils, tf_utils, nametags,
-  observations, flag_utils, train_lib
+  observations, flag_utils
 )
+import slippi_ai.mirror as mirror_lib
 from slippi_ai.controller_lib import send_controller
 from slippi_ai.controller_heads import SampleOutputs
-from slippi_db.parse_libmelee import get_game
+from slippi_db.parse_libmelee import Parser
 
 def disable_gpus():
   tf.config.set_visible_devices([], 'GPU')
@@ -93,7 +93,7 @@ class BasicAgent:
     default_controller = self._embed_controller.dummy([batch_size])
     self._prev_controller = default_controller
 
-    def sample(
+    def base_sample(
         state_action: embed.StateAction,
         prev_state: policies.RecurrentState,
         needs_reset: tf.Tensor,
@@ -101,7 +101,10 @@ class BasicAgent:
       return policy.sample(
           state_action, prev_state, needs_reset, **sample_kwargs)
 
-    def multi_sample(
+    # Note that (compiled) multi_sample doesn't work with set_name_code
+    # because the name code is baked into the tensorflow graph.
+    # TODO: optimize with packed_compile
+    def base_multi_sample(
         states: list[tuple[embed.Game, tf.Tensor]],  # time-indexed
         prev_action: embed.Action,  # only for first step
         initial_state: policies.RecurrentState,
@@ -114,28 +117,96 @@ class BasicAgent:
             action=prev_action,
             name=self._name_code,
         )
-        next_action, hidden_state = sample(
+        next_action, hidden_state = base_sample(
             state_action, hidden_state, needs_reset)
         actions.append(next_action)
         prev_action = next_action.controller_state
 
       return actions, hidden_state
 
+    sample_1 = base_sample
+    multi_sample_1 = base_multi_sample
+
     if run_on_cpu:
       if jit_compile and tf.config.list_physical_devices('GPU'):
         raise UserWarning("jit compilation may ignore run_on_cpu")
-      sample = tf_utils.run_on_cpu(sample)
-      multi_sample = tf_utils.run_on_cpu(multi_sample)
+      sample_1 = tf_utils.run_on_cpu(base_sample)
+      multi_sample_1 = tf_utils.run_on_cpu(base_multi_sample)
 
     if compile:
-      compile_fn = tf.function(jit_compile=jit_compile, autograph=False)
-      sample = compile_fn(sample)
-      multi_sample = compile_fn(multi_sample)
+      # compile_fn = tf.function(jit_compile=jit_compile, autograph=False)
+      # base_multi_sample = compile_fn(base_multi_sample)
 
-    self._sample = sample
-    self._multi_sample = multi_sample
+      # Packing significantly speeds up single-step inference, particularly
+      # when items are enabled.
+      sample_2 = tf_utils.packed_compile(
+          sample_1,
+          self.sample_signature(),
+          jit_compile=jit_compile,
+          autograph=False,
+      )
+
+      @functools.cache
+      def compile_multi_sample(num_steps: int):
+        return tf_utils.packed_compile(
+            multi_sample_1,
+            self.multi_sample_signature(num_steps),
+            jit_compile=jit_compile,
+            autograph=False,
+        )
+
+      def multi_sample_2(
+          states: list[tuple[embed.Game, tf.Tensor]],  # time-indexed
+          prev_action: embed.Action,  # only for first step
+          initial_state: policies.RecurrentState,
+      ) -> Tuple[list[SampleOutputs], policies.RecurrentState]:
+        compiled_fn = compile_multi_sample(len(states))
+        return compiled_fn(states, prev_action, initial_state)
+
+    else:
+      sample_2 = sample_1
+      multi_sample_2 = multi_sample_1
+
+    self._sample = sample_2
+    self._multi_sample = multi_sample_2
 
     self.hidden_state = self._policy.initial_state(batch_size)
+
+  def sample_signature(self) -> tf_utils.Signature:
+    dummy_state_action = self._policy.embed_state_action.dummy([self._batch_size])
+    dummy_state_action = utils.map_nt(
+        lambda x: tf_utils.ArraySpec(
+            shape=x.shape,
+            dtype=x.dtype,
+        ), dummy_state_action)
+
+    # Don't pack action and prev_state as they are already Tensors.
+    dummy_state_action = dummy_state_action._replace(action=None)
+    prev_state = None
+
+    needs_reset = tf_utils.ArraySpec(
+        shape=(self._batch_size,),
+        dtype=np.dtype('bool'),
+    )
+
+    return (dummy_state_action, prev_state, needs_reset)
+
+  def multi_sample_signature(self, num_steps: int) -> tf_utils.Signature:
+    dummy_state = self._policy.embed_game.dummy([self._batch_size])
+    dummy_state_spec = utils.map_nt(
+        lambda x: tf_utils.ArraySpec(
+            shape=x.shape,
+            dtype=x.dtype,
+        ), dummy_state)
+
+    needs_reset_spec = tf_utils.ArraySpec(
+        shape=(self._batch_size,),
+        dtype=np.dtype('bool'),
+    )
+
+    states_spec = [(dummy_state_spec, needs_reset_spec)] * num_steps
+
+    return (states_spec, None, None)
 
   def set_name_code(self, name_code: tp.Union[int, tp.Sequence[int]]):
     if isinstance(name_code, int):
@@ -233,10 +304,10 @@ class DelayedAgent:
     self._policy = policy
     self.embed_controller = policy.controller_embedding
 
-    if console_delay > policy.delay:
+    if console_delay > policy.delay - (self.batch_steps - 1):
       raise ValueError(
           f'console delay ({console_delay}) must be <='
-          f' policy delay ({policy.delay})')
+          f' policy delay ({policy.delay}) - batch_steps ({self.batch_steps}) + 1')
 
     self.delay = policy.delay - console_delay
     self._output_queue: utils.PeekableQueue[SampleOutputs] \
@@ -367,14 +438,14 @@ class AsyncDelayedAgent:
     self.embed_controller = policy.controller_embedding
 
     self.delay = policy.delay - console_delay
-    if self.delay < 0:
+    headroom = self.delay - (self.batch_steps - 1)
+    if headroom < 0:
       raise ValueError(
+          f'No headroom: '
           f'console delay ({console_delay}) must be <='
-          f' policy delay ({policy.delay})')
-    elif self.delay == 0:
-      logging.warning(
-          f'Console delay ({console_delay}) equals policy delay ({policy.delay}),'
-          ' agent will effectively run synchronously.')
+          f' policy delay ({policy.delay}) - batch_steps ({self.batch_steps}) + 1')
+    elif headroom == 0:
+      logging.warning('No headroom, agent will effectively run synchronously.')
 
     self._output_queue: utils.PeekableQueue[SampleOutputs] \
       = utils.PeekableQueue()
@@ -547,6 +618,7 @@ class Agent:
       port: tp.Optional[int] = None,
       controller: tp.Optional[melee.Controller] = None,
       name_change_mode: NameChangeMode = NameChangeMode.FIXED,
+      mirror: bool = False,
       **agent_kwargs,
   ):
     self._controller = controller
@@ -560,6 +632,7 @@ class Agent:
     self.players = (self._port, opponent_port)
     self.config = config
     self.name_change_mode = name_change_mode
+    self.mirror = mirror
 
     self.name_map: dict[str, int] = state['name_map']
     rl_names = get_name_from_rl_state(state)
@@ -601,9 +674,12 @@ class Agent:
     if new_game:
       self.update_name()
       self._observation_filter.reset()
+      self._parser = Parser(ports=self.players)
 
     needs_reset = np.array([new_game])
-    game = get_game(gamestate, ports=self.players)
+    game = self._parser.get_game(gamestate)
+    if self.mirror:
+      game = mirror_lib.mirror_game(game)
     game = self._observation_filter.filter(game)
     game = utils.map_nt(lambda x: np.expand_dims(x, 0), game)
 
@@ -612,6 +688,10 @@ class Agent:
     # Note: x.item() can return the wrong dtype, e.g. int instead of uint8.
     action = utils.map_nt(lambda x: x[0], action)
     action = self._agent.embed_controller.decode(action)
+    if self.mirror:
+      action = mirror_lib.mirror_controller(action)
+
+    assert self._controller is not None
     send_controller(self._controller, action)
     return sample_outputs
 
@@ -649,6 +729,7 @@ BATCH_AGENT_FLAGS = dict(
     fake=ff.Boolean(False, 'Use fake agents.'),
     # Generally we want to set `run_on_cpu` once for all agents.
     # run_on_cpu=ff.Boolean(False, 'Run the agent on the CPU.'),
+    batch_steps=ff.Integer(0, 'Number of steps to batch (in time)'),
 )
 
 AGENT_FLAGS = dict(
@@ -656,6 +737,7 @@ AGENT_FLAGS = dict(
     name_change_mode=ff.EnumClass(
         NameChangeMode.FIXED, NameChangeMode,
         'How to change the agent name.'),
+    mirror=ff.Boolean(False, 'Mirror the x axis.'),
 )
 
 PLAYER_FLAGS = dict(

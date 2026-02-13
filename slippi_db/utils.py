@@ -131,6 +131,7 @@ class LocalFile(abc.ABC):
   def read(self) -> bytes:
     """Read the file bytes."""
 
+  @contextmanager
   @abc.abstractmethod
   def extract(self, tmpdir: str) -> tp.Generator[str, None, None]:
     """Extract the file to a temporary directory and return it."""
@@ -162,7 +163,7 @@ class SimplePath(LocalFile):
     with open(os.path.join(self.root, self.path), 'rb') as f:
       return f.read()
 
-_GZ_SUFFIX = '.gz'
+GZ_SUFFIX = '.gz'
 
 class GZipFile(LocalFile):
   """A gzipped file."""
@@ -170,12 +171,12 @@ class GZipFile(LocalFile):
   def __init__(self, root: str, path: str):
     self.root = root
     self.path = path
-    if not path.endswith(_GZ_SUFFIX):
+    if not path.endswith(GZ_SUFFIX):
       raise ValueError(f'{root}/{path} is not a gz file?')
 
   @property
   def name(self) -> str:
-    return self.path.removesuffix(_GZ_SUFFIX)
+    return self.path.removesuffix(GZ_SUFFIX)
 
   def read(self) -> bytes:
     with gzip.open(os.path.join(self.root, self.path)) as f:
@@ -224,23 +225,49 @@ class ZipFile(LocalFile):
   def __init__(self, root: str, path: str):
     self.root = root
     self.path = path
-    self.is_gzipped = path.endswith(_GZ_SUFFIX)
+
+    suffix_found = False
+    for suffix in VALID_SUFFIXES:
+      if path.endswith(suffix):
+        suffix_found = True
+        self.suffix = suffix
+        break
+
+    if not suffix_found:
+      raise ValueError(f'{root}/{path} is not a valid Slippi file?')
+
+    self.base_name = self.path.removesuffix(self.suffix)
+
+    self.is_gzipped = path.endswith(GZ_SUFFIX)
+    self.is_slpz = path.endswith(SLPZ_SUFFIX)
 
   @property
   def name(self) -> str:
-    return self.path.removesuffix(_GZ_SUFFIX)
+    return self.base_name + _SLP_SUFFIX
 
-  def read(self) -> bytes:
+  def read_raw(self) -> bytes:
     try:
       result = subprocess.run(
           ['unzip', '-p', self.root, self.path],
-          check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+          check=True, capture_output=True)
     except subprocess.CalledProcessError as e:
       raise FileReadException(e.stderr.decode()) from e
-    data = result.stdout
+    return result.stdout
+
+  def from_raw(self, data: bytes) -> bytes:
     if self.is_gzipped:
       data = gzip.decompress(data)
+
+    if self.is_slpz:
+      result = subprocess.run(
+          ['slpz', '-d', '-', '-o', '-'],
+          capture_output=True, input=data, check=True)
+      data = result.stdout
+
     return data
+
+  def read(self) -> bytes:
+    return self.from_raw(self.read_raw())
 
   @contextmanager
   def extract(self, tmpdir: str) -> Generator[str, None, None]:
@@ -295,6 +322,8 @@ def traverse_7z_fast(
   archive = py7zr.SevenZipFile(path, 'r')
 
   # calculate optimal chunks
+  assert archive.header.main_streams is not None
+  assert archive.header.main_streams.unpackinfo is not None
   folders = archive.header.main_streams.unpackinfo.folders
 
   max_chunk_size = chunk_size_gb * 1024**3
@@ -361,13 +390,22 @@ def traverse_7z_fast(
   return [SevenZipChunk(path, chunk) for chunk in chunks]
 
 _SLP_SUFFIX = '.slp'
-VALID_SUFFIXES = [_SLP_SUFFIX, _SLP_SUFFIX + _GZ_SUFFIX]
+SLPZ_SUFFIX = '.slpz'
+VALID_SUFFIXES = [
+    _SLP_SUFFIX,
+    _SLP_SUFFIX + GZ_SUFFIX,
+    SLPZ_SUFFIX,
+]
 
-def traverse_slp_files_zip(root: str) -> list[LocalFile]:
+def is_slp_file(path: str) -> bool:
+  """Check if the file is a valid Slippi replay file."""
+  return any(path.endswith(s) for s in VALID_SUFFIXES)
+
+def traverse_slp_files_zip(root: str) -> list[ZipFile]:
   files = []
-  relpaths = zipfile.PyZipFile(root).namelist()
+  relpaths = zipfile.ZipFile(root).namelist()
   for path in relpaths:
-    if any(path.endswith(s) for s in VALID_SUFFIXES):
+    if is_slp_file(path):
       files.append(ZipFile(root, path))
   return files
 
@@ -380,6 +418,7 @@ def extract_zip_files(source_zip: str, file_names: list[str], dest_zip: str) -> 
   with subprocess.Popen(
       ['zip',  '-U', source_zip, '-@', '--out', dest_zip],
       stdin=subprocess.PIPE) as zip_proc:
+    assert zip_proc.stdin is not None
     for file_name in file_names:
       zip_proc.stdin.write(file_name.encode('utf-8'))
       zip_proc.stdin.write(b'\n')
@@ -440,6 +479,7 @@ def rename_within_zip(zip_path: str, to_rename: list[tuple[str, str]]) -> None:
 
   # Note: zipnote is very picky about the input format.
   with subprocess.Popen(['zipnote', zip_path], stdout=subprocess.PIPE) as proc:
+    assert proc.stdout is not None
     lines = proc.stdout.readlines()
     proc.wait()
 
@@ -448,9 +488,35 @@ def rename_within_zip(zip_path: str, to_rename: list[tuple[str, str]]) -> None:
     rename_mapping[f'@ {src}\n'.encode('utf-8')] = f'@={dst}\n'.encode('utf-8')
 
   with subprocess.Popen(['zipnote', '-w', zip_path], stdin=subprocess.PIPE) as proc:
+    assert proc.stdin is not None
     for line in lines:
       proc.stdin.write(line)
       if line in rename_mapping:
         proc.stdin.write(rename_mapping.pop(line))
     proc.stdin.close()
     proc.wait()
+
+def delete_from_zip(zip_path: str, file_names: list[str]) -> None:
+  """Deletes specified files from a zip archive.
+
+  Args:
+    zip_path: Path to the zip archive.
+    file_names: List of file names within the archive to delete.
+  """
+  if not os.path.exists(zip_path):
+    raise FileNotFoundError(f'Zip file {zip_path} does not exist')
+
+  if not file_names:
+    return
+
+  with subprocess.Popen(
+      ['zip', '-d', '-q', zip_path, '-@'],
+      stdin=subprocess.PIPE) as zip_proc:
+    assert zip_proc.stdin is not None
+    for file_name in file_names:
+      zip_proc.stdin.write(file_name.encode('utf-8'))
+      zip_proc.stdin.write(b'\n')
+    zip_proc.stdin.close()
+    zip_proc.wait()
+    if zip_proc.returncode != 0:
+      raise subprocess.CalledProcessError(zip_proc.returncode, ['zip', '-d', zip_path, '-@'])

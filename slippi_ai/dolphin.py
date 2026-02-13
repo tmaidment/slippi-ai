@@ -54,8 +54,16 @@ class AI(Player):
 def is_menu_state(gamestate: melee.GameState) -> bool:
   return gamestate.menu_state not in [melee.Menu.IN_GAME, melee.Menu.SUDDEN_DEATH]
 
+def is_game_state(gamestate: melee.GameState) -> bool:
+  return gamestate.menu_state in (melee.Menu.IN_GAME, melee.Menu.SUDDEN_DEATH)
+
+INITIAL_FRAME = -123
+
 class ConnectFailed(Exception):
   """Raised when we fail to connect to the console."""
+
+class WrongCharacterSelected(Exception):
+  """Raised on the initial frame if the wrong character is selected."""
 
 class Dolphin:
 
@@ -75,13 +83,17 @@ class Dolphin:
       render: Optional[bool] = None,  # Render even when running headless.
       connect_code: Optional[str] = None,
       copy_home_directory: bool = False,
+      min_slp_version: Optional[tuple[int, int, int]] = (3, 18, 0),
       **console_kwargs,
   ) -> None:
     self._players = players
     self.stage = stage
+    self.min_slp_version = min_slp_version
 
     platform = None
-    path = path or default_dolphin_install_path()
+
+    # TODO: some of this logic should be moved to Console
+    path = path or default_dolphin_install_path()[0]
     version = get_dolphin_version(path)
 
     if render is None:
@@ -128,7 +140,7 @@ class Dolphin:
     self.console = console
 
     self.controllers: Mapping[int, melee.Controller] = {}
-    self._menuing_controllers: list[tuple[melee.Controller, Player]] = []
+    self._menuing_controllers: list[tuple[melee.Controller, CPU | AI]] = []
     self._autostart = True
     self._connect_code = connect_code
 
@@ -148,7 +160,7 @@ class Dolphin:
           console, port, player.controller_type())
       self.controllers[port] = controller
 
-      if not isinstance(player, Human):
+      if isinstance(player, (CPU, AI)):
         self._menuing_controllers.append((controller, player))
 
     console.run(
@@ -176,13 +188,36 @@ class Dolphin:
     if gamestate is None:
       raise TimeoutError('Console timed out.')
 
-    if (
-      gamestate.frame == -123
-      and self.console.slp_version_tuple >= (3, 19, 0)
-      and gamestate.stage is melee.Stage.POKEMON_STADIUM
-    ):
-      if not self.console.is_frozen_ps:
+    # Perform some checks at the start of the game
+    if is_game_state(gamestate) and gamestate.frame == INITIAL_FRAME:
+      assert self.console.slp_version_tuple is not None
+
+      if (
+        self.min_slp_version is not None
+        and self.console.slp_version_tuple < self.min_slp_version
+      ):
+        raise RuntimeError(
+          f'Slippi version {self.console.slp_version_tuple} is too old. '
+          f'Minimum required is {self.min_slp_version}.')
+
+      # Phillip doesn't work well on unfrozen stadium
+      if (
+        self.console.slp_version_tuple >= (3, 19, 0)
+        and gamestate.stage is melee.Stage.POKEMON_STADIUM
+        and not self.console.is_frozen_ps
+      ):
         logging.warning('Playing on unfrozen stadium')
+
+      # Check that we picked the desired characters
+      for controller, player in self._menuing_controllers:
+        gs_player = gamestate.players[controller.port]
+        desired_character = player.character
+        actual_character = gs_player.character
+        if actual_character != desired_character:
+          raise WrongCharacterSelected(
+            f'Port {controller.port}: expected character '
+            f'{desired_character.name}, got {actual_character.name}'
+          )
 
     return gamestate
 
@@ -202,7 +237,7 @@ class Dolphin:
             gamestate, controller,
             stage_selected=self.stage,
             connect_code=self._connect_code,
-            autostart=self._autostart and i == 0 and menu_frames > 180,
+            autostart=self._autostart and i == 0 and menu_frames > 30,
             swag=False,
             costume=i,
             **player.menuing_kwargs())
@@ -268,6 +303,7 @@ class DolphinConfig:
   replay_dir: Optional[str] = None  # Directory to save replays to.
   gfx_backend: str = ''  # Graphics backend to use.
   disable_audio: bool = False  # Disable dolphin audio.
+  audio_backend: str = ''  # Audio backend to use.
   headless: bool = True  # Headless configuration: exi + ffw, no graphics or audio.
   emulation_speed: float = 1.0  # Set to 0 for unlimited speed. Mainline only.
   infinite_time: bool = True  # Infinite time no stocks.

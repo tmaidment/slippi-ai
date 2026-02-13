@@ -1,3 +1,13 @@
+"""Parsed games are stored as Arrow `GAME_TYPE` StructArrays.
+
+For each Struct[Array] type, we define a corresponding NamedTuple for easier
+manipulation and type checking in Python. The type annotations in these
+are scalars, but in practice they are often arrays of the given type with a
+time and/or batch dimension.
+TODO: use the "returns" library + mypy to get higher-kinded types working.
+"""
+
+
 import functools
 from typing import Mapping, NamedTuple, TypeVar, Union
 import numpy as np
@@ -32,6 +42,19 @@ class Controller(NamedTuple):
   shoulder: np.float32
   buttons: Buttons
 
+class Nana(NamedTuple):
+  exists: np.bool_
+  percent: np.uint16
+  facing: np.bool_
+  x: np.float32
+  y: np.float32
+  action: np.uint16
+  invulnerable: np.bool_
+  character: np.uint8
+  jumps_left: np.uint8
+  shield_strength: np.float32
+  on_ground: np.bool_
+
 class Player(NamedTuple):
   percent: np.uint16
   facing: np.bool_
@@ -44,11 +67,42 @@ class Player(NamedTuple):
   shield_strength: np.float32
   on_ground: np.bool_
   controller: Controller
+  nana: Nana
+
+class Randall(NamedTuple):
+  x: np.float32
+  y: np.float32
+
+class FoDPlatforms(NamedTuple):
+  left: np.float32
+  right: np.float32
+
+MAX_ITEMS = 15  # Maximum number of items per frame
+
+class Item(NamedTuple):
+  exists: bool  # Is the Item slot used
+  type: np.uint16
+  state: np.uint8
+  # owner?
+  # facing: np.float32
+  x: np.float32
+  y: np.float32
+
+
+Items = NamedTuple('Items', [
+    (f'item_{i}', Item) for i in range(MAX_ITEMS)
+])
 
 class Game(NamedTuple):
   p0: Player
   p1: Player
+
   stage: np.uint8
+  randall: Randall
+  fod_platforms: FoDPlatforms
+
+  items: Items
+
 
 # maps pyarrow types back to NamedTuples
 PA_TO_NT = {}
@@ -71,6 +125,7 @@ def nt_to_pa(nt: type) -> pa.StructType:
 BUTTONS_TYPE = nt_to_pa(Buttons)
 STICK_TYPE = nt_to_pa(Stick)
 CONTROLLER_TYPE = nt_to_pa(Controller)
+NANA_TYPE = nt_to_pa(Nana)
 PLAYER_TYPE = nt_to_pa(Player)
 GAME_TYPE = nt_to_pa(Game)
 
@@ -104,7 +159,7 @@ def array_to_nest(val: pa.Array) -> Nest[np.ndarray]:
     assert val.type.num_fields == 0
     return val.to_numpy(zero_copy_only=False)
 
-def array_to_nt(nt: type, val: pa.Array) -> Union[tuple, np.ndarray]:
+def array_to_nt(nt: type[T], val: pa.Array) -> T:
   if issubclass(nt, tuple):
     assert isinstance(val.type, pa.StructType)
     result = {}
