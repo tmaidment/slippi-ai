@@ -106,6 +106,65 @@ def find_offstage_shine_stalls(player: Player, stage: np.ndarray):
       is_stalling_offstage(player, stage),
       is_aerial_shine(player))
 
+def punish_window_stats(
+    player: Player,
+    opponent: Player,
+    max_gap_frames: int = 45,
+) -> tuple[float, float]:
+  """Combo-length proxy based on punish windows rather than contiguous damage.
+
+  A window starts when we damage or KO the opponent. It continues through short
+  gaps (e.g. hitstun/chase) and ends when either:
+    1) the gap since our last offensive event exceeds `max_gap_frames`, or
+    2) we take damage / die (clear momentum loss).
+  """
+  opp_damage = process_damages(opponent.percent) > 0
+  opp_death = process_deaths(opponent.action)
+  player_damage = process_damages(player.percent) > 0
+  player_death = process_deaths(player.action)
+
+  offensive_event = np.logical_or(opp_damage, opp_death)
+  momentum_lost = np.logical_or(player_damage, player_death)
+
+  if offensive_event.size == 0:
+    return 0.0, 0.0
+
+  flat_events = offensive_event.reshape(offensive_event.shape[0], -1)
+  flat_momentum_lost = momentum_lost.reshape(momentum_lost.shape[0], -1)
+
+  lengths: list[int] = []
+  for i in range(flat_events.shape[1]):
+    events = flat_events[:, i]
+    losses = flat_momentum_lost[:, i]
+
+    in_window = False
+    start = 0
+    last_event = -1
+
+    for t in range(events.shape[0]):
+      if not in_window:
+        if events[t]:
+          in_window = True
+          start = t
+          last_event = t
+        continue
+
+      if events[t]:
+        last_event = t
+
+      gap_exceeded = (t - last_event) > max_gap_frames
+      if losses[t] or gap_exceeded:
+        lengths.append(max(last_event - start + 1, 1))
+        in_window = False
+
+    if in_window:
+      lengths.append(max(last_event - start + 1, 1))
+
+  if not lengths:
+    return 0.0, 0.0
+
+  return float(np.mean(lengths)), float(np.max(lengths))
+
 @dataclasses.dataclass
 class RewardConfig:
   damage_ratio: float = 0.01
@@ -182,12 +241,32 @@ def player_stats(
 ) -> dict:
   FPM = 60 * 60
 
+  player_offstage = amount_offstage(player, stage) > 0
+  opponent_offstage = amount_offstage(opponent, stage) > 0
+  onstage_both = np.logical_and(
+      np.logical_not(player_offstage),
+      np.logical_not(opponent_offstage))
+  closer_to_center = np.abs(player.x) < np.abs(opponent.x)
+
+  valid_center_frames = onstage_both.sum()
+  if valid_center_frames > 0:
+    center_control_pct = 100 * np.logical_and(
+        closer_to_center, onstage_both).sum() / valid_center_frames
+  else:
+    center_control_pct = 0.0
+
+  combo_len_mean, combo_len_max = punish_window_stats(player, opponent)
+
   stats = dict(
       deaths=process_deaths(player.action).mean() * FPM,
       damages=process_damages(player.percent).mean() * FPM,
       ledge_grabs=get_bad_ledge_grabs(player, opponent).mean() * FPM,
       approaching_factor=compute_approaching_factor(player, opponent).mean(),
       stalling=is_stalling_offstage(player, stage, stalling_threshold).mean(),
+      combo_len_mean=combo_len_mean,
+      combo_len_max=combo_len_max,
+      center_control_pct=float(center_control_pct),
+      offstage_time_pct=float(100 * player_offstage.mean()),
   )
 
   if player.nana != ():

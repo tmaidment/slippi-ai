@@ -589,6 +589,10 @@ def run(config: Config):
     step_time = step_profiler.mean_time()
     frames_per_rollout = config.actor.num_envs * config.actor.rollout_length
     fps = len(trajectories) * frames_per_rollout / step_time
+    steps_per_sec_collected = fps
+    env_steps_per_sec = steps_per_sec_collected / config.actor.num_envs
+    ppo_batches_per_sec = len(trajectories) / step_time
+    learner_steps_per_sec = 1.0 / step_time
     mps = fps / (60 * 60)  # in-game minutes per second
 
     timings.update(
@@ -597,6 +601,10 @@ def run(config: Config):
         reset=learner_manager.reset_profiler.mean_time(),
         total=step_time,
         fps=fps,
+        steps_per_sec_collected=steps_per_sec_collected,
+        env_steps_per_sec=env_steps_per_sec,
+        ppo_batches_per_sec=ppo_batches_per_sec,
+        learner_steps_per_sec=learner_steps_per_sec,
         mps=mps,
     )
     actor_timing = metrics['actor'].pop('timing')
